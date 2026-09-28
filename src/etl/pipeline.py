@@ -1,6 +1,6 @@
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # 確保可以匯入 src 下的模組
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -10,9 +10,7 @@ from src.database.models import League, Team, Fixture, OddsHistory, ApiMapping
 from src.api_clients.football_clients import FootballDataClient, ApiFootballClient, TheOddsApiClient
 
 def normalize_name(name: str) -> str:
-    """
-    名稱標準化：去除大小寫、FC、常見縮寫與空格，便於跨 API 進行初步比對
-    """
+    """名稱標準化：去除大小寫、FC、常見縮寫與空格"""
     if not name:
         return ""
     return name.lower().replace("fc", "").replace("united", "utd").replace(" ", "").strip()
@@ -28,7 +26,6 @@ class FootballETLPipeline:
         """根據外部名稱與來源，透過 ApiMapping 尋找或建立內部標準 Team 實體"""
         norm_name = normalize_name(external_name)
         
-        # 1. 檢查 Mapping 表是否已經存在該來源的對應關係
         mapping = self.db.query(ApiMapping).filter(
             ApiMapping.entity_type == 'team',
             ApiMapping.provider == provider,
@@ -36,12 +33,10 @@ class FootballETLPipeline:
         ).first()
 
         if mapping:
-            # 找到 Mapping，直接回傳對應的標準 Team
             team = self.db.query(Team).filter(Team.id == int(mapping.standard_id)).first()
             if team:
                 return team
 
-        # 2. 如果沒有 Mapping，則尋找是否已有相似標準名稱的球隊 (簡化版邏輯)
         all_teams = self.db.query(Team).all()
         matched_team = None
         for t in all_teams:
@@ -49,14 +44,12 @@ class FootballETLPipeline:
                 matched_team = t
                 break
 
-        # 3. 若完全不存在符合的球隊，建立新球隊
         if not matched_team:
             matched_team = Team(standard_name=external_name)
             self.db.add(matched_team)
             self.db.commit()
             self.db.refresh(matched_team)
 
-        # 4. 將新的對應關係寫入 Mapping 記錄
         new_mapping = ApiMapping(
             entity_type='team',
             standard_id=str(matched_team.id),
@@ -68,12 +61,18 @@ class FootballETLPipeline:
 
         return matched_team
 
-    def sync_football_data_matches(self):
-        """同步 Football-Data.org 的近期賽程 (作為範例)"""
-        print("開始同步 Football-Data.org 賽程資料...")
-        today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    def sync_historical_and_upcoming_matches(self, days_back: int = 30, days_forward: int = 7):
+        """
+        擴大同步範圍：包含過去 N 天的歷史賽果（含比分）與未來 N 天的賽程，
+        供機器學習模型進行特徵工程與盤口關聯分析。
+        """
+        today = datetime.utcnow().date()
+        date_from = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        date_to = (today + timedelta(days=days_forward)).strftime("%Y-%m-%d")
         
-        matches = self.fd_client.get_matches(today_str, today_str)
+        print(f"開始同步賽程資料，區間: {date_from} 至 {date_to} (含歷史完賽與未來賽事)...")
+        
+        matches = self.fd_client.get_matches(date_from, date_to)
         
         for m in matches:
             competition = m.get("competition", {})
@@ -93,13 +92,17 @@ class FootballETLPipeline:
             if not home_team_name or not away_team_name:
                 continue
 
-            # 透過 Mapping 取得或建立球隊
             home_team = self.get_or_create_team(home_team_name, "football_data")
             away_team = self.get_or_create_team(away_team_name, "football_data")
 
-            # 處理時間格式
             match_utc_str = m.get("utcDate")
             match_datetime = datetime.fromisoformat(match_utc_str.replace("Z", "+00:00")).replace(tzinfo=None)
+
+            # 提取比分資料 (若已完賽 FT)
+            status = m.get("status", "NS")
+            score_data = m.get("score", {}).get("fullTime", {})
+            home_score = score_data.get("home")
+            away_score = score_data.get("away")
 
             # 檢查賽程是否已存在
             existing_fixture = self.db.query(Fixture).filter(
@@ -115,22 +118,25 @@ class FootballETLPipeline:
                     home_team_id=home_team.id,
                     away_team_id=away_team.id,
                     match_datetime=match_datetime,
-                    status=m.get("status", "NS")
+                    status=status,
+                    home_score=home_score,
+                    away_score=away_score
                 )
                 self.db.add(new_fixture)
                 self.db.commit()
-                print(f"新增賽事: [{league_name}] {home_team_name} vs {away_team_name}")
+                print(f"新增賽事: [{league_name}] {home_team_name} vs {away_team_name} (狀態: {status}, 比分: {home_score}:{away_score})")
             else:
-                # 這裡可以加入更新狀態的邏輯 (例如從 NS 變為 FT)
-                pass
+                # 更新現有賽事的狀態與比分（例如完賽後的比分更新）
+                existing_fixture.status = status
+                existing_fixture.home_score = home_score
+                existing_fixture.away_score = away_score
+                self.db.commit()
 
-        print("Football-Data.org 賽程同步完成！")
+        print("賽程與歷史數據同步完成！")
 
     def run_pipeline(self):
-        """執行完整的資料管線"""
-        print("--- 啟動 ETL 管線 ---")
-        self.sync_football_data_matches()
-        # 未來可在此擴充 sync_api_football_stats() 和 sync_odds()
+        print("--- 啟動擴充版 ETL 管線 ---")
+        self.sync_historical_and_upcoming_matches(days_back=30, days_forward=7)
         self.db.close()
         print("--- ETL 管線執行結束 ---")
 
