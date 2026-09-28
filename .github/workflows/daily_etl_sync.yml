@@ -1,0 +1,56 @@
+name: Daily Football ETL Sync
+
+# 設定觸發條件
+on:
+  # 每天 UTC 時間早上 08:00 和 晚上 20:00 執行 (香港時間約為 16:00 和 04:00)
+  schedule:
+    - cron: '0 8,20 * * *'
+  
+  # 允許我們在 GitHub 網頁上手動點擊按鈕執行
+  workflow_dispatch:
+
+jobs:
+  run-etl-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # 快取套件以加快後續執行速度
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Initialize Database (if not exists)
+        run: |
+          python -m src.database.init_db
+        env:
+          DATABASE_URL: "sqlite:///./football_platform.db"
+
+      - name: Run ETL Pipeline
+        # 將我們之前設定的 Secrets 作為環境變數傳入 Python 腳本
+        env:
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+          DATABASE_URL: "sqlite:///./football_platform.db"
+        run: |
+          python -m src.etl.pipeline
+
+      # (可選進階設定) 將更新後的 SQLite 資料庫推回 GitHub 保存
+      # 注意：在正式營運且資料量大時，建議將資料庫改為雲端 PostgreSQL (如 Supabase/Neon)，就不需要這一步了
+      - name: Commit and push updated database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add football_platform.db
+          
+          # 只有當資料庫檔案有變更時才進行 Commit
+          git diff --quiet && git diff --staged --quiet || (git commit -m "auto: 🗃️ update local database from ETL pipeline" && git push)
