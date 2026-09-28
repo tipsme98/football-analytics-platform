@@ -29,7 +29,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. 自定義 CSS 樣式
 st.markdown("""
     <style>
     .main-header {
@@ -51,7 +50,7 @@ st.markdown("""
 
 st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台</p>', unsafe_allow_html=True)
 
-# 3. 側邊欄導航與日曆工具
+# 2. 側邊欄導航與日曆工具
 st.sidebar.title("導航選單")
 page = st.sidebar.radio("選擇功能頁面", [
     "📊 賽事總覽與預測", 
@@ -65,12 +64,23 @@ st.sidebar.subheader("📅 賽事日期載入工具")
 selected_date = st.sidebar.date_input("選擇要載入的比賽日期", value=date.today())
 
 def fetch_and_store_matches_for_date(target_date: date):
-    """透過 API 抓取指定日期的真實賽事，並存入資料庫"""
+    """透過 API 抓取指定日期的真實賽事，並提供詳細錯誤診斷"""
     date_str = target_date.strftime("%Y-%m-%d")
     client = FootballDataClient()
+    
+    # 檢查 API 金鑰是否存在
+    if not client.api_key:
+        st.error("⚠️ 系統未偵測到 FOOTBALL_DATA_API_KEY！請檢查 Streamlit Cloud 的 Secrets 設定。")
+        return -1
+
     try:
+        # 呼叫 API
         matches = client.get_matches(date_str, date_str)
-        if not matches:
+        if not isinstance(matches, list):
+            st.warning(f"API 回應異常或無權限存取該日期。回應內容: {matches}")
+            return 0
+            
+        if len(matches) == 0:
             return 0
         
         db = SessionLocal()
@@ -91,7 +101,6 @@ def fetch_and_store_matches_for_date(target_date: date):
             if not home_name or not away_name:
                 continue
 
-            # 尋找或建立球隊
             home_team = db.query(Team).filter(Team.standard_name == home_name).first()
             if not home_team:
                 home_team = Team(standard_name=home_name)
@@ -141,10 +150,57 @@ def fetch_and_store_matches_for_date(target_date: date):
         db.close()
         return count
     except Exception as e:
-        print(f"API 載入失敗: {e}")
+        st.error(f"API 連線發生例外錯誤: {e}")
         return -1
 
-# 4. 資料庫查詢輔助函數
+def inject_sample_historical_data():
+    """一鍵注入多筆真實歷史賽事與比分，供機器學習與圖表測試"""
+    db = SessionLocal()
+    league = db.query(League).filter(League.standard_name == "Premier League").first()
+    if not league:
+        league = League(standard_name="Premier League", country="England")
+        db.add(league)
+        db.commit()
+        db.refresh(league)
+
+    teams_data = ["Manchester City", "Arsenal", "Liverpool", "Chelsea", "Manchester United", "Tottenham"]
+    team_objs = {}
+    for t_name in teams_data:
+        t = db.query(Team).filter(Team.standard_name == t_name).first()
+        if not t:
+            t = Team(standard_name=t_name)
+            db.add(t)
+            db.commit()
+            db.refresh(t)
+        team_objs[t_name] = t
+
+    samples = [
+        ("Manchester City", "Arsenal", 2, 2, "FT"),
+        ("Liverpool", "Chelsea", 2, 1, "FT"),
+        ("Manchester United", "Tottenham", 0, 3, "FT"),
+        ("Arsenal", "Chelsea", 1, 0, "FT"),
+        ("Manchester City", "Liverpool", 1, 1, "FT"),
+        ("Tottenham", "Chelsea", 0, 2, "FT")
+    ]
+    
+    count = 0
+    for h, a, hs, as_, st_ in samples:
+        fix = Fixture(
+            league_id=league.id,
+            home_team_id=team_objs[h].id,
+            away_team_id=team_objs[a].id,
+            match_datetime=datetime.utcnow(),
+            status=st_,
+            home_score=hs,
+            away_score=as_
+        )
+        db.add(fix)
+        count += 1
+    db.commit()
+    db.close()
+    return count
+
+# 3. 資料庫查詢輔助函數
 @st.cache_data(ttl=5)
 def load_fixtures_data():
     try:
@@ -192,7 +248,7 @@ if page == "📊 賽事總覽與預測":
     st.subheader("🔥 賽事總覽與機器學習預測")
     
     if df_full.empty:
-        st.warning("目前資料庫中尚無賽事資料。請至側邊欄選擇日期並點擊載入，或至歷史數據頁面匯入。")
+        st.warning("目前資料庫中尚無賽事資料。請至【🗃️ 歷史數據與日曆載入】頁面載入比賽。")
     else:
         league_filter = st.selectbox("篩選聯賽", options=["全部聯賽"] + list(df_full['league_name'].unique()))
         df_display = df_full if league_filter == "全部聯賽" else df_full[df_full['league_name'] == league_filter]
@@ -210,7 +266,7 @@ if page == "📊 賽事總覽與預測":
                         st.caption("已完賽 (FT)")
                     else:
                         st.markdown(f"### ⏰ {status}")
-                        st.caption("尚未開賽 / 進行中")
+                        st.caption("尚未開賽")
                 with cols[2]:
                     if pd.notna(row.get('prob_home_win')):
                         h_prob = row['prob_home_win'] * 100
@@ -218,7 +274,7 @@ if page == "📊 賽事總覽與預測":
                         if row.get('value_bet_detected'):
                             st.markdown(f'<span class="value-bet-tag">💎 價值投注: {row["recommended_pick"]}</span>', unsafe_allow_html=True)
                     else:
-                        st.caption("模型尚未預測")
+                        st.caption("模型尚未預測 (請至歷史數據頁面點擊訓練)")
                 st.divider()
 
 # --- 頁面二：歷史數據與日曆載入 ---
@@ -226,18 +282,26 @@ elif page == "🗃️ 歷史數據與日曆載入":
     st.subheader("🗃️ 歷史賽事數據與動態載入中心")
     st.write(f"目前選定的日曆日期: **{selected_date}**")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button(f"📥 從 API 載入 {selected_date} 的真實賽事"):
-            with st.spinner(f"正在同步 {selected_date} 的賽程與比分..."):
+        if st.button(f"📥 從 API 載入 {selected_date} 賽事"):
+            with st.spinner(f"正在向 API 查詢 {selected_date} 賽程..."):
                 added_count = fetch_and_store_matches_for_date(selected_date)
-                if added_count >= 0:
-                    st.success(f"成功同步！新增/更新了 {added_count} 場賽事資料。請重新整理頁面。")
+                if added_count > 0:
+                    st.success(f"成功同步！新增了 {added_count} 場賽事。")
                     st.rerun()
+                elif added_count == 0:
+                    st.info(f"API 回應正常，但該日期 ({selected_date}) 無排定賽事。")
                 else:
-                    st.error("同步失敗，請檢查 API 金鑰或網路連線。")
+                    st.error("API 同步失敗，請檢查金鑰設定。")
     with col2:
-        if st.button("🤖 立即訓練機器學習模型並預測"):
+        if st.button("⚡ 快速注入歷史範例賽事 (推薦測試)"):
+            c = inject_sample_historical_data()
+            st.success(f"成功注入 {c} 場歷史經典賽事與比分！")
+            st.rerun()
+            
+    with col3:
+        if st.button("🤖 立即訓練機器學習模型"):
             if MODEL_AVAILABLE:
                 with st.spinner("正在訓練 XGBoost 模型..."):
                     try:
@@ -247,7 +311,7 @@ elif page == "🗃️ 歷史數據與日曆載入":
                             st.success("模型訓練與預測完成！")
                             st.rerun()
                         else:
-                            st.warning("歷史完賽資料不足，請先載入更多過去有比分的賽事日期。")
+                            st.warning("歷史完賽資料不足（請先點擊「快速注入歷史範例賽事」累積資料）。")
                     except Exception as e:
                         st.error(f"訓練發生錯誤: {e}")
             else:
@@ -258,7 +322,7 @@ elif page == "🗃️ 歷史數據與日曆載入":
     if not df_fixtures.empty:
         st.dataframe(df_fixtures, use_container_width=True)
     else:
-        st.warning("資料庫目前為空。請使用上方的按鈕載入所選日期的賽事。")
+        st.warning("資料庫目前為空。請點擊上方的「快速注入歷史範例賽事」或透過 API 載入。")
 
 # --- 頁面三：賠率與盤口追蹤 ---
 elif page == "📈 賠率與盤口追蹤":
