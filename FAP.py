@@ -5,10 +5,17 @@ from datetime import datetime
 import sys
 import os
 
-# 確保可以讀取 src 內的模組與資料庫
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+# --- 路徑強制修正：確保雲端環境絕對能抓到 src 模組 ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.append(CURRENT_DIR)
+
 from src.database.connection import engine
-from src.ml.model import FootballPredictor
+try:
+    from src.ml.model import FootballPredictor
+    MODEL_AVAILABLE = True
+except Exception as e:
+    MODEL_AVAILABLE = False
 
 # 1. 頁面基本配置 (優化手機與網頁顯示)
 st.set_page_config(
@@ -48,7 +55,7 @@ st.markdown("""
 # 標題
 st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台</p>', unsafe_allow_html=True)
 
-# 3. 側邊欄導航 (新增歷史數據總覽)
+# 3. 側邊欄導航
 st.sidebar.title("導航選單")
 page = st.sidebar.radio("選擇功能頁面", [
     "📊 賽事總覽與預測", 
@@ -122,7 +129,7 @@ if page == "📊 賽事總覽與預測":
         else:
             df_display = df_full
 
-        for idx, row in df_display.head(50).iterrows(): # 顯示前 50 筆
+        for idx, row in df_display.head(50).iterrows():
             with st.container():
                 cols = st.columns([3, 2, 3])
                 with cols[0]:
@@ -148,24 +155,27 @@ if page == "📊 賽事總覽與預測":
                         st.caption("尚未生成預測")
                 st.divider()
 
-# --- 頁面二：歷史數據與資料庫總覽 (新功能) ---
+# --- 頁面二：歷史數據與資料庫總覽 ---
 elif page == "🗃️ 歷史數據與資料庫總覽":
     st.subheader("🗃️ 資料庫內容與歷史賽果總覽")
-    st.write("在這裡你可以直接檢視資料庫中已同步的歷史賽事、比分，並手動執行模型訓練。")
+    st.write("在這裡你可以檢視資料庫中已同步的歷史賽事、比分，並手動執行模型訓練。")
     
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🤖 立即訓練機器學習模型並生成預測"):
-            with st.spinner("正在訓練 XGBoost 模型並進行預測..."):
-                try:
-                    predictor = FootballPredictor()
-                    if predictor.train_model():
-                        predictor.predict_upcoming_matches()
-                        st.success("模型訓練與預測完成！請重新整理頁面查看結果。")
-                    else:
-                        st.error("歷史完賽資料不足，無法訓練模型。")
-                except Exception as e:
-                    st.error(f"執行發生錯誤: {e}")
+            if MODEL_AVAILABLE:
+                with st.spinner("正在訓練 XGBoost 模型並進行預測..."):
+                    try:
+                        predictor = FootballPredictor()
+                        if predictor.train_model():
+                            predictor.predict_upcoming_matches()
+                            st.success("模型訓練與預測完成！請重新整理頁面查看結果。")
+                        else:
+                            st.error("歷史完賽資料不足（需至少 50 筆），無法訓練模型。")
+                    except Exception as e:
+                        st.error(f"執行發生錯誤: {e}")
+            else:
+                st.error("無法載入機器學習模組 (XGBoost)。")
     
     st.markdown("---")
     st.subheader("📋 資料庫中的原始賽事與比分紀錄")
@@ -197,7 +207,7 @@ elif page == "📈 賠率與盤口追蹤":
             )
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("目前尚無賠率歷史數據紀錄（等待 The Odds API 數據接入中）。")
+            st.info("目前尚無賠率歷史數據紀錄。")
     except Exception as e:
         st.info("尚無賠率資料表。")
 
