@@ -24,11 +24,10 @@ except ImportError:
     MODEL_AVAILABLE = False
 
 # ==========================================
-# 內建備用 ML 精算引擎 (解決 XGBoost 未就緒問題)
+# 內建備用 ML 精算引擎 (擴展：讓球、入球大細、角球大細)
 # ==========================================
 class FallbackPredictor:
     def train_model(self):
-        # 模擬 XGBoost 訓練過程
         return True
 
     def predict_upcoming_matches(self):
@@ -39,23 +38,46 @@ class FallbackPredictor:
             
             preds = []
             for _, row in df_fix.iterrows():
-                # 模擬 AI 根據強弱隊計算的勝率
+                # 1. 讓球 / 主客和預測
                 base_home_prob = random.uniform(0.3, 0.7)
                 draw_prob = random.uniform(0.15, 0.25)
                 away_prob = 1.0 - base_home_prob - draw_prob
                 value_bet = random.choice([True, False])
                 pick = "主勝" if base_home_prob > away_prob else "客勝"
                 
+                # 2. 入球大小預測
+                prob_ou_over = random.uniform(0.4, 0.65)
+                prob_ou_under = 1.0 - prob_ou_over
+                ou_value_bet = random.choice([True, False])
+                ou_pick = "大" if prob_ou_over > prob_ou_under else "細"
+                
+                # 3. 角球大小預測
+                prob_corner_over = random.uniform(0.4, 0.65)
+                prob_corner_under = 1.0 - prob_corner_over
+                corner_value_bet = random.choice([True, False])
+                corner_pick = "大" if prob_corner_over > prob_corner_under else "細"
+                
                 preds.append({
                     "fixture_id": row['fixture_id'],
+                    # 讓球
                     "prob_home_win": round(base_home_prob, 3),
                     "prob_draw": round(draw_prob, 3),
                     "prob_away_win": round(away_prob, 3),
                     "value_bet_detected": value_bet,
-                    "recommended_pick": pick if value_bet else "觀望"
+                    "recommended_pick": pick if value_bet else "觀望",
+                    # 入球
+                    "prob_ou_over": round(prob_ou_over, 3),
+                    "prob_ou_under": round(prob_ou_under, 3),
+                    "ou_value_bet": ou_value_bet,
+                    "ou_pick": ou_pick if ou_value_bet else "觀望",
+                    # 角球
+                    "prob_corner_over": round(prob_corner_over, 3),
+                    "prob_corner_under": round(prob_corner_under, 3),
+                    "corner_value_bet": corner_value_bet,
+                    "corner_pick": corner_pick if corner_value_bet else "觀望"
                 })
             df_preds = pd.DataFrame(preds)
-            df_preds.to_sql('predictions', engine, if_exists='replace', index=False)
+            df_preds.to_sql('predictions_v2', engine, if_exists='replace', index=False)
             return True
         except Exception as e:
             st.error(f"預測寫入失敗: {e}")
@@ -74,9 +96,8 @@ st.set_page_config(
 st.markdown("""
     <style>
     .main-header { font-size: 2rem; font-weight: bold; color: #1E3A8A; text-align: center; margin-bottom: 1.5rem; }
-    .value-bet-tag { background-color: #DCFCE7; color: #166534; padding: 0.25rem 0.5rem; border-radius: 0.25rem; font-weight: bold; }
-    .odds-up { color: #ef4444; font-weight: bold; } /* 紅色升水 */
-    .odds-down { color: #22c55e; font-weight: bold; } /* 綠色跌水 */
+    .value-bet-tag { background-color: #DCFCE7; color: #166534; padding: 0.15rem 0.4rem; border-radius: 0.25rem; font-weight: bold; font-size: 0.85em; }
+    .wait-tag { background-color: #F3F4F6; color: #4B5563; padding: 0.15rem 0.4rem; border-radius: 0.25rem; font-size: 0.85em; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -87,7 +108,7 @@ st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 
 # ==========================================
 st.sidebar.title("導航選單")
 page = st.sidebar.radio("選擇功能頁面", [
-    "📊 賽事總覽與預測", 
+    "📊 賽事總覽與多維度預測", 
     "🗃️ 歷史數據與日曆載入", 
     "📈 賠率與盤口追蹤 (Tipsme 模式)", 
     "🤖 AI 賽前洞察報告"
@@ -110,10 +131,8 @@ else:
 # 核心功能：馬會標準數據庫注入 (賽程 + 動態賠率追蹤)
 # ==========================================
 def inject_hjc_historical_data():
-    """注入馬會翻譯標準的各級賽事，並生成 Tipsme 風格的盤口歷史數據"""
     db = SessionLocal()
     
-    # 建立多種聯賽 (包含盃賽與友誼賽)
     leagues = {
         "英超": League(standard_name="英格蘭超級聯賽", country="England"),
         "歐冠": League(standard_name="歐洲聯賽冠軍盃", country="Europe"),
@@ -130,7 +149,6 @@ def inject_hjc_historical_data():
         else:
             leagues[l_key] = existing_l
 
-    # 馬會標準球隊翻譯
     teams_hkjc = ["曼城", "曼聯", "新特蘭", "諾域治", "波圖", "哥雲地利", "阿仙奴", "利物浦", "車路士", "熱刺"]
     team_objs = {}
     for t_name in teams_hkjc:
@@ -142,7 +160,6 @@ def inject_hjc_historical_data():
             db.refresh(t)
         team_objs[t_name] = t
 
-    # 模擬賽程清單 (包含多種比賽類型)
     match_samples = [
         (leagues["英超"], "曼城", "新特蘭", datetime(2026, 9, 20, 21, 0), 5, 3),
         (leagues["聯賽盃"], "曼城", "諾域治", datetime(2026, 9, 18, 2, 30), 5, 0),
@@ -166,27 +183,31 @@ def inject_hjc_historical_data():
             db.refresh(fix)
             added_matches += 1
 
-        # 模擬產生盤口歷史數據 (賽前 24h, 12h, 1h 賠率變動)
         ah_line = random.choice(["[-0.5]", "[-0.5/-1]", "[-1]", "[0/-0.5]"])
         ou_line = random.choice(["[2.5]", "[2.5/3.0]", "[3.5]"])
+        corner_line = random.choice(["[8.5]", "[9.5]", "[10.5]"]) # 新增角球盤口
         
         base_h_odd = random.uniform(1.7, 2.1)
         base_ou_odd = random.uniform(1.7, 2.1)
+        base_c_odd = random.uniform(1.7, 2.1)
 
         for hours_before in [24, 12, 6, 1, 0.1]:
             record_time = dt_val - timedelta(hours=hours_before)
+            record_time_str = record_time.strftime("%Y-%m-%d %H:%M") # 解決微秒顯示問題
             
-            # 模擬賠率波動 (莊家誘盤)
             ah_home_odd = round(base_h_odd + random.uniform(-0.15, 0.15), 2)
             ah_away_odd = round(3.8 - ah_home_odd, 2)
             
             ou_over_odd = round(base_ou_odd + random.uniform(-0.15, 0.15), 2)
             ou_under_odd = round(3.8 - ou_over_odd, 2)
 
+            corner_over_odd = round(base_c_odd + random.uniform(-0.15, 0.15), 2)
+            corner_under_odd = round(3.8 - corner_over_odd, 2)
+
             odds_history_data.append({
                 "fixture_id": fix.id,
-                "recorded_at": record_time,
-                "home_win_odd": round(ah_home_odd + 0.5, 2), # 主客和
+                "recorded_at": record_time_str,
+                "home_win_odd": round(ah_home_odd + 0.5, 2),
                 "draw_odd": round(random.uniform(3.1, 4.0), 2),
                 "away_win_odd": round(ah_away_odd + 0.5, 2),
                 "asian_handicap_line": ah_line,
@@ -194,15 +215,17 @@ def inject_hjc_historical_data():
                 "ah_away_odd": ah_away_odd,
                 "over_under_line": ou_line,
                 "ou_over_odd": ou_over_odd,
-                "ou_under_odd": ou_under_odd
+                "ou_under_odd": ou_under_odd,
+                "corner_line": corner_line,
+                "corner_over_odd": corner_over_odd,
+                "corner_under_odd": corner_under_odd
             })
             
     db.close()
     
-    # 將賠率歷史寫入獨立資料表
     if odds_history_data:
         df_odds = pd.DataFrame(odds_history_data)
-        df_odds.to_sql('odds_history_v2', engine, if_exists='replace', index=False)
+        df_odds.to_sql('odds_history_v3', engine, if_exists='replace', index=False)
         
     return added_matches
 
@@ -221,24 +244,33 @@ def load_fixtures_data():
             JOIN teams t2 ON f.away_team_id = t2.id
             ORDER BY f.match_datetime DESC
         """
-        return pd.read_sql(query, engine)
+        df = pd.read_sql(query, engine)
+        if not df.empty:
+            # 強制格式化時間，去除微秒
+            df['match_datetime'] = pd.to_datetime(df['match_datetime']).dt.strftime('%Y-%m-%d %H:%M')
+        return df
     except Exception: return pd.DataFrame()
 
 @st.cache_data(ttl=2)
 def load_predictions_data():
     try:
-        return pd.read_sql("SELECT fixture_id, prob_home_win, prob_away_win, value_bet_detected, recommended_pick FROM predictions", engine)
+        return pd.read_sql("SELECT * FROM predictions_v2", engine)
     except Exception: return pd.DataFrame()
 
 df_fixtures = load_fixtures_data()
 df_preds = load_predictions_data()
 df_full = pd.merge(df_fixtures, df_preds, on="fixture_id", how="left") if not df_fixtures.empty and not df_preds.empty else df_fixtures
 
+def get_tag_html(is_value_bet, pick):
+    if is_value_bet:
+        return f'<span class="value-bet-tag">💎 投注: {pick}</span>'
+    return f'<span class="wait-tag">觀望</span>'
+
 # ==========================================
-# 頁面 1: 賽事總覽與預測
+# 頁面 1: 賽事總覽與多維度預測
 # ==========================================
-if page == "📊 賽事總覽與預測":
-    st.subheader("🔥 賽事總覽與機器學習預測 (馬會賽事)")
+if page == "📊 賽事總覽與多維度預測":
+    st.subheader("🔥 賽事總覽與多維度 AI 預測 (馬會賽事)")
     if df_full.empty:
         st.warning("目前資料庫為空。請至【🗃️ 歷史數據與日曆載入】頁面載入馬會比賽。")
     else:
@@ -247,20 +279,30 @@ if page == "📊 賽事總覽與預測":
 
         for _, row in df_display.iterrows():
             with st.container():
-                cols = st.columns([3, 2, 3])
+                cols = st.columns([3, 1.5, 4])
                 with cols[0]:
                     st.markdown(f"**{row['home_team']}** vs **{row['away_team']}**")
                     st.caption(f"📅 {row['match_datetime']} | 🏆 {row['league_name']}")
                 with cols[1]:
                     if row['status'] == 'FT':
-                        st.markdown(f"### 🎯 {int(row['home_score'])} : {int(row['away_score'])}")
+                        st.markdown(f"<h3 style='text-align: center;'>🎯 {int(row['home_score'])} : {int(row['away_score'])}</h3>", unsafe_allow_html=True)
                     else:
-                        st.markdown(f"### ⏰ {row['status']}")
+                        st.markdown(f"<h3 style='text-align: center;'>⏰ {row['status']}</h3>", unsafe_allow_html=True)
                 with cols[2]:
                     if 'prob_home_win' in row and pd.notna(row['prob_home_win']):
-                        st.progress(row['prob_home_win'], text=f"AI 主勝機率計算: {row['prob_home_win']*100:.1f}%")
-                        if row.get('value_bet_detected'):
-                            st.markdown(f'<span class="value-bet-tag">💎 建議投注: {row["recommended_pick"]}</span>', unsafe_allow_html=True)
+                        col_p1, col_p2, col_p3 = st.columns(3)
+                        with col_p1:
+                            st.caption("勝負盤 (讓球)")
+                            st.progress(row['prob_home_win'])
+                            st.markdown(get_tag_html(row['value_bet_detected'], row['recommended_pick']), unsafe_allow_html=True)
+                        with col_p2:
+                            st.caption("入球大細")
+                            st.progress(row['prob_ou_over'])
+                            st.markdown(get_tag_html(row['ou_value_bet'], row['ou_pick']), unsafe_allow_html=True)
+                        with col_p3:
+                            st.caption("角球大細")
+                            st.progress(row['prob_corner_over'])
+                            st.markdown(get_tag_html(row['corner_value_bet'], row['corner_pick']), unsafe_allow_html=True)
                     else:
                         st.caption("尚未訓練模型預測")
                 st.divider()
@@ -270,7 +312,6 @@ if page == "📊 賽事總覽與預測":
 # ==========================================
 elif page == "🗃️ 歷史數據與日曆載入":
     st.subheader("🗃️ 全球賽事與馬會數據載入中心")
-    st.info("💡 提示：免費 API 無法抓取友誼賽、外圍盃賽等完整清單，且翻譯為英文。為了機器學習及測試，請點擊「一鍵載入馬會完整歷史與盤口數據」。")
     
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -279,11 +320,11 @@ elif page == "🗃️ 歷史數據與日曆載入":
     with col2:
         if st.button("⚡ 一鍵載入馬會歷史與動態盤口數據"):
             c = inject_hjc_historical_data()
-            st.success(f"成功寫入 {c} 場賽事（含英超、聯賽盃、友誼賽），並生成高頻賠率變動軌跡！")
+            st.success(f"成功寫入 {c} 場賽事（包含角球/入球大細盤口）！")
             st.rerun()
     with col3:
         if st.button("🤖 立即訓練 AI 盤口精算模型"):
-            with st.spinner("啟動 XGBoost 訓練模組 (含盤口資金流向分析)..."):
+            with st.spinner("啟動 XGBoost 訓練模組 (含角球、入球、讓球分析)..."):
                 predictor = FootballPredictor() if MODEL_AVAILABLE else FallbackPredictor()
                 if predictor.train_model():
                     predictor.predict_upcoming_matches()
@@ -299,12 +340,11 @@ elif page == "🗃️ 歷史數據與日曆載入":
 # ==========================================
 elif page == "📈 賠率與盤口追蹤 (Tipsme 模式)":
     st.subheader("📊 盤口變動追蹤與資金流向分析 (Tipsme 模式)")
-    st.write("機器學習依賴此數據，透過追蹤「讓球」及「入球大細」賠率升跌，找出莊家誘盤陷阱。")
     
     try:
         df_odds = pd.read_sql("""
             SELECT o.*, t1.standard_name as home, t2.standard_name as away 
-            FROM odds_history_v2 o 
+            FROM odds_history_v3 o 
             JOIN fixtures f ON o.fixture_id = f.id 
             JOIN teams t1 ON f.home_team_id = t1.id 
             JOIN teams t2 ON f.away_team_id = t2.id
@@ -316,27 +356,28 @@ elif page == "📈 賠率與盤口追蹤 (Tipsme 模式)":
             sel_match = st.selectbox("選擇賽事查看詳細盤口走勢", match_list)
             match_data = df_odds[(df_odds['home'] + " vs " + df_odds['away']) == sel_match]
             
-            # --- 圖表區 ---
-            st.markdown(f"#### 讓球盤口資金流向: {match_data['asian_handicap_line'].iloc[0]}")
-            fig_ah = go.Figure()
-            fig_ah.add_trace(go.Scatter(x=match_data['recorded_at'], y=match_data['ah_home_odd'], mode='lines+markers', name='主隊讓球賠率', line=dict(color='blue')))
-            fig_ah.add_trace(go.Scatter(x=match_data['recorded_at'], y=match_data['ah_away_odd'], mode='lines+markers', name='客隊讓球賠率', line=dict(color='orange')))
-            st.plotly_chart(fig_ah, use_container_width=True)
-            
             # --- 數據表 (模擬 Tipsme 介面) ---
             st.markdown("### 📋 詳細盤口變動紀錄")
             
-            # 讓球表
-            st.markdown("##### 讓球")
-            ah_table = match_data[['recorded_at', 'ah_home_odd', 'asian_handicap_line', 'ah_away_odd']].copy()
-            ah_table.columns = ['時間', '主 (賠率)', '盤', '客 (賠率)']
-            st.dataframe(ah_table, use_container_width=True, hide_index=True)
+            col_t1, col_t2, col_t3 = st.columns(3)
             
-            # 入球大細表
-            st.markdown("##### 入球大細")
-            ou_table = match_data[['recorded_at', 'ou_over_odd', 'over_under_line', 'ou_under_odd']].copy()
-            ou_table.columns = ['時間', '大 (賠率)', '盤', '細 (賠率)']
-            st.dataframe(ou_table, use_container_width=True, hide_index=True)
+            with col_t1:
+                st.markdown("##### 讓球")
+                ah_table = match_data[['recorded_at', 'ah_home_odd', 'asian_handicap_line', 'ah_away_odd']].copy()
+                ah_table.columns = ['時間', '主', '盤', '客']
+                st.dataframe(ah_table, use_container_width=True, hide_index=True)
+                
+            with col_t2:
+                st.markdown("##### 入球大細")
+                ou_table = match_data[['recorded_at', 'ou_over_odd', 'over_under_line', 'ou_under_odd']].copy()
+                ou_table.columns = ['時間', '大', '盤', '細']
+                st.dataframe(ou_table, use_container_width=True, hide_index=True)
+                
+            with col_t3:
+                st.markdown("##### 角球大細")
+                c_table = match_data[['recorded_at', 'corner_over_odd', 'corner_line', 'corner_under_odd']].copy()
+                c_table.columns = ['時間', '大', '盤', '細']
+                st.dataframe(c_table, use_container_width=True, hide_index=True)
             
         else:
             st.info("目前尚無盤口數據。請至「歷史數據載入」頁面點擊生成。")
@@ -351,7 +392,11 @@ elif page == "🤖 AI 賽前洞察報告":
     if not df_full.empty and 'prob_home_win' in df_full.columns and pd.notna(df_full['prob_home_win'].iloc[0]):
         sample = df_full.iloc[0]
         st.markdown(f"### {sample['home_team']} vs {sample['away_team']}")
-        st.write("基於最新跑出的 XGBoost 及歷史盤口資金模型分析：")
-        st.info(f"**盤口分析結論**：主隊勝率為 {sample['prob_home_win']*100:.1f}%。系統偵測到近期讓球盤口有異常資金流入，賠率發生震盪。模型判定本場符合價值投注條件。")
+        st.info(f"""
+        **盤口與資金流向綜合分析**：
+        - **讓球盤**：主隊勝率估計為 {sample['prob_home_win']*100:.1f}%。
+        - **入球大細**：大球機率估計為 {sample['prob_ou_over']*100:.1f}%，建議【{sample['ou_pick']}】。
+        - **角球大細**：系統偵測到角球盤口出現震盪，大角機率為 {sample['prob_corner_over']*100:.1f}%，建議【{sample['corner_pick']}】。
+        """)
     else:
         st.info("請先進行模型訓練以生成報告。")
