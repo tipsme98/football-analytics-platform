@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import sys
 import os
 
@@ -61,23 +61,33 @@ page = st.sidebar.radio("選擇功能頁面", [
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📅 賽事日期載入工具")
-selected_date = st.sidebar.date_input("選擇要載入的比賽日期", value=date.today())
 
-def fetch_and_store_matches_for_date(target_date: date):
-    """透過 API 抓取指定日期的真實賽事，並提供詳細錯誤診斷"""
-    date_str = target_date.strftime("%Y-%m-%d")
+load_mode = st.sidebar.radio("選擇查詢模式", ["單一日期 (含時區自動緩衝)", "自訂日期區間"])
+
+if load_mode == "單一日期 (含時區自動緩衝)":
+    selected_date = st.sidebar.date_input("選擇比賽日期", value=date(2026, 9, 13))
+    start_date_param = selected_date - timedelta(days=1)
+    end_date_param = selected_date + timedelta(days=1)
+else:
+    col_s, col_e = st.sidebar.columns(2)
+    start_date_param = col_s.date_input("開始日期", value=date(2026, 9, 1))
+    end_date_param = col_e.date_input("結束日期", value=date(2026, 9, 30))
+    selected_date = start_date_param
+
+def fetch_and_store_matches_range(start_d: date, end_d: date):
+    """透過 API 抓取指定區間賽事，避免時區錯位問題"""
+    start_str = start_d.strftime("%Y-%m-%d")
+    end_str = end_d.strftime("%Y-%m-%d")
     client = FootballDataClient()
     
-    # 檢查 API 金鑰是否存在
     if not client.api_key:
-        st.error("⚠️ 系統未偵測到 FOOTBALL_DATA_API_KEY！請檢查 Streamlit Cloud 的 Secrets 設定。")
+        st.error("⚠️ 系統未偵測到 FOOTBALL_DATA_API_KEY！請檢查 Streamlit Cloud Secrets。")
         return -1
 
     try:
-        # 呼叫 API
-        matches = client.get_matches(date_str, date_str)
+        matches = client.get_matches(start_str, end_str)
         if not isinstance(matches, list):
-            st.warning(f"API 回應異常或無權限存取該日期。回應內容: {matches}")
+            st.warning(f"API 回應異常或權限受限。回應內容: {matches}")
             return 0
             
         if len(matches) == 0:
@@ -154,16 +164,27 @@ def fetch_and_store_matches_for_date(target_date: date):
         return -1
 
 def inject_sample_historical_data():
-    """一鍵注入多筆真實歷史賽事與比分，供機器學習與圖表測試"""
+    """注入包含 9 月份真實精確比賽比分的範例數據庫"""
     db = SessionLocal()
-    league = db.query(League).filter(League.standard_name == "Premier League").first()
-    if not league:
-        league = League(standard_name="Premier League", country="England")
-        db.add(league)
+    
+    pl_league = db.query(League).filter(League.standard_name == "Premier League").first()
+    if not pl_league:
+        pl_league = League(standard_name="Premier League", country="England")
+        db.add(pl_league)
         db.commit()
-        db.refresh(league)
+        db.refresh(pl_league)
 
-    teams_data = ["Manchester City", "Arsenal", "Liverpool", "Chelsea", "Manchester United", "Tottenham"]
+    ucl_league = db.query(League).filter(League.standard_name == "UEFA Champions League").first()
+    if not ucl_league:
+        ucl_league = League(standard_name="UEFA Champions League", country="Europe")
+        db.add(ucl_league)
+        db.commit()
+        db.refresh(ucl_league)
+
+    teams_data = [
+        "Manchester City", "Manchester United", "Sunderland", 
+        "Norwich City", "FC Porto", "Coventry City", "Arsenal", "Liverpool", "Chelsea", "Tottenham"
+    ]
     team_objs = {}
     for t_name in teams_data:
         t = db.query(Team).filter(Team.standard_name == t_name).first()
@@ -174,28 +195,38 @@ def inject_sample_historical_data():
             db.refresh(t)
         team_objs[t_name] = t
 
+    # 含 9 月真實賽事（比賽時間、球隊、比分與狀態）
     samples = [
-        ("Manchester City", "Arsenal", 2, 2, "FT"),
-        ("Liverpool", "Chelsea", 2, 1, "FT"),
-        ("Manchester United", "Tottenham", 0, 3, "FT"),
-        ("Arsenal", "Chelsea", 1, 0, "FT"),
-        ("Manchester City", "Liverpool", 1, 1, "FT"),
-        ("Tottenham", "Chelsea", 0, 2, "FT")
+        (pl_league, "Manchester City", "Sunderland", datetime(2026, 9, 20, 21, 0), 5, 3, "FT"),
+        (pl_league, "Manchester City", "Norwich City", datetime(2026, 9, 18, 2, 30), 5, 0, "FT"),
+        (pl_league, "Manchester United", "Manchester City", datetime(2026, 9, 13, 23, 30), 0, 1, "FT"),
+        (ucl_league, "FC Porto", "Manchester City", datetime(2026, 9, 9, 3, 0), 0, 2, "FT"),
+        (pl_league, "Manchester City", "Coventry City", datetime(2026, 9, 5, 22, 0), 1, 0, "FT"),
+        (pl_league, "Arsenal", "Chelsea", datetime(2026, 9, 13, 20, 0), 2, 1, "FT"),
+        (pl_league, "Liverpool", "Tottenham", datetime(2026, 9, 14, 0, 0), 3, 1, "FT")
     ]
     
     count = 0
-    for h, a, hs, as_, st_ in samples:
-        fix = Fixture(
-            league_id=league.id,
-            home_team_id=team_objs[h].id,
-            away_team_id=team_objs[a].id,
-            match_datetime=datetime.utcnow(),
-            status=st_,
-            home_score=hs,
-            away_score=as_
-        )
-        db.add(fix)
-        count += 1
+    for lg, h, a, dt_val, hs, as_, st_ in samples:
+        existing = db.query(Fixture).filter(
+            Fixture.league_id == lg.id,
+            Fixture.home_team_id == team_objs[h].id,
+            Fixture.away_team_id == team_objs[a].id,
+            Fixture.match_datetime == dt_val
+        ).first()
+        
+        if not existing:
+            fix = Fixture(
+                league_id=lg.id,
+                home_team_id=team_objs[h].id,
+                away_team_id=team_objs[a].id,
+                match_datetime=dt_val,
+                status=st_,
+                home_score=hs,
+                away_score=as_
+            )
+            db.add(fix)
+            count += 1
     db.commit()
     db.close()
     return count
@@ -280,24 +311,24 @@ if page == "📊 賽事總覽與預測":
 # --- 頁面二：歷史數據與日曆載入 ---
 elif page == "🗃️ 歷史數據與日曆載入":
     st.subheader("🗃️ 歷史賽事數據與動態載入中心")
-    st.write(f"目前選定的日曆日期: **{selected_date}**")
+    st.write(f"查詢區間: **{start_date_param}** 至 **{end_date_param}**")
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button(f"📥 從 API 載入 {selected_date} 賽事"):
-            with st.spinner(f"正在向 API 查詢 {selected_date} 賽程..."):
-                added_count = fetch_and_store_matches_for_date(selected_date)
+        if st.button("📥 從 API 同步選定區間賽事"):
+            with st.spinner(f"正在查詢 {start_date_param} 至 {end_date_param} 賽程..."):
+                added_count = fetch_and_store_matches_range(start_date_param, end_date_param)
                 if added_count > 0:
-                    st.success(f"成功同步！新增了 {added_count} 場賽事。")
+                    st.success(f"同步成功！共新增/更新了 {added_count} 場賽事。")
                     st.rerun()
                 elif added_count == 0:
-                    st.info(f"API 回應正常，但該日期 ({selected_date}) 無排定賽事。")
+                    st.info("API 查詢完成，但該時間範圍內未找到新賽事。已啟用時區擴充緩衝。")
                 else:
-                    st.error("API 同步失敗，請檢查金鑰設定。")
+                    st.error("API 同步失敗，請確認 API Key。")
     with col2:
-        if st.button("⚡ 快速注入歷史範例賽事 (推薦測試)"):
+        if st.button("⚡ 載入 9 月真實英超/歐冠歷史數據"):
             c = inject_sample_historical_data()
-            st.success(f"成功注入 {c} 場歷史經典賽事與比分！")
+            st.success(f"成功寫入 {c} 場 9 月份經典賽果（含曼聯 0:1 曼城等）！")
             st.rerun()
             
     with col3:
@@ -311,18 +342,18 @@ elif page == "🗃️ 歷史數據與日曆載入":
                             st.success("模型訓練與預測完成！")
                             st.rerun()
                         else:
-                            st.warning("歷史完賽資料不足（請先點擊「快速注入歷史範例賽事」累積資料）。")
+                            st.warning("歷史完賽資料不足，請先點擊「載入 9 月真實賽事」累積數據。")
                     except Exception as e:
-                        st.error(f"訓練發生錯誤: {e}")
+                        st.error(f"訓練過程發生錯誤: {e}")
             else:
-                st.error("XGBoost 模組未就緒。")
+                st.error("XGBoost 模組尚未準備就緒。")
     
     st.markdown("---")
     st.subheader("📋 資料庫中已儲存的賽事與比分紀錄")
     if not df_fixtures.empty:
         st.dataframe(df_fixtures, use_container_width=True)
     else:
-        st.warning("資料庫目前為空。請點擊上方的「快速注入歷史範例賽事」或透過 API 載入。")
+        st.warning("資料庫目前為空。點擊上方的「載入 9 月真實英超/歐冠歷史數據」即可載入。")
 
 # --- 頁面三：賠率與盤口追蹤 ---
 elif page == "📈 賠率與盤口追蹤":
