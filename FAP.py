@@ -38,17 +38,20 @@ db_connection_warning = None
 if DATABASE_URL:
     try:
         url = DATABASE_URL
+        # 強制指定使用 psycopg2 驅動，解決 No module named 'psycopg' 錯誤
         if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql://", 1)
+            url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+        elif url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
         
         # 嘗試使用 psycopg2/postgresql 引擎
         temp_engine = create_engine(url, pool_pre_ping=True)
-        # 測試測試連線
+        # 測試連線
         with temp_engine.connect() as conn:
             pass
         engine = temp_engine
     except Exception as e:
-        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗 (可能缺少 psycopg2-binary 套件)，已自動切換回本地 SQLite。詳細錯誤: {e}"
+        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。詳細錯誤: {e}"
         engine = sqlite_engine
 
 # --- 3. 自動初始化資料庫表架構 ---
@@ -208,7 +211,7 @@ st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 
 if db_connection_warning:
     st.warning(db_connection_warning)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
 
 def get_tag_html(pick):
     if pick != "觀望": return f'<span class="value-bet-tag">💎 投注: {pick}</span>'
@@ -389,8 +392,6 @@ with tab4:
             with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據..."):
                 try:
                     img = Image.open(uploaded_files[0])
-                    model = genai.GenerativeModel('gemini-1.5-flash')
-                    
                     prompt = """
                     請精確提取這張足球比賽截圖中的資訊，並嚴格只回傳純 JSON 格式（不要Markdown括號或其餘文字）：
                     {
@@ -418,7 +419,16 @@ with tab4:
                       }
                     }
                     """
-                    response = model.generate_content([prompt, img])
+                    
+                    # 使用最新的模型標籤並加入降級容錯機制
+                    try:
+                        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                        response = model.generate_content([prompt, img])
+                    except Exception as model_err:
+                        # 如果 flash-latest 也失敗，則降級嘗試 pro 版本
+                        model = genai.GenerativeModel('gemini-1.5-pro-latest')
+                        response = model.generate_content([prompt, img])
+                        
                     raw_text = response.text.strip().replace("```json", "").replace("```", "")
                     parsed_data = json.loads(raw_text)
                     
