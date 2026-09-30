@@ -38,7 +38,7 @@ db_connection_warning = None
 if DATABASE_URL:
     try:
         url = DATABASE_URL
-        # 強制指定使用 psycopg2 驅動，解決 No module named 'psycopg' 錯誤
+        # 強制指定使用 psycopg2 驅動
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+psycopg2://", 1)
         elif url.startswith("postgresql://"):
@@ -51,7 +51,8 @@ if DATABASE_URL:
             pass
         engine = temp_engine
     except Exception as e:
-        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。詳細錯誤: {e}"
+        # 如果 Supabase 暫停或網址錯誤，會在此處被攔截並顯示提示
+        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。請檢查 Streamlit Secrets 中的 DATABASE_URL 是否正確，或 Supabase 專案是否進入暫停(Pause)狀態。詳細錯誤: {e}"
         engine = sqlite_engine
 
 # --- 3. 自動初始化資料庫表架構 ---
@@ -211,7 +212,7 @@ st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 
 if db_connection_warning:
     st.warning(db_connection_warning)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
 
 def get_tag_html(pick):
     if pick != "觀望": return f'<span class="value-bet-tag">💎 投注: {pick}</span>'
@@ -389,7 +390,7 @@ with tab4:
         uploaded_files = st.file_uploader("上傳賽事截圖", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
         if uploaded_files and st.button("🚀 開始 Gemini 智能識別與重構 UI", type="primary"):
-            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據..."):
+            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據 (啟動多重模型備援)..."):
                 try:
                     img = Image.open(uploaded_files[0])
                     prompt = """
@@ -420,35 +421,42 @@ with tab4:
                     }
                     """
                     
-                    # 使用最新的模型標籤並加入降級容錯機制
-                    try:
-                        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-                        response = model.generate_content([prompt, img])
-                    except Exception as model_err:
-                        # 如果 flash-latest 也失敗，則降級嘗試 pro 版本
-                        model = genai.GenerativeModel('gemini-1.5-pro-latest')
-                        response = model.generate_content([prompt, img])
-                        
-                    raw_text = response.text.strip().replace("```json", "").replace("```", "")
-                    parsed_data = json.loads(raw_text)
+                    # 實作多重模型容錯機制
+                    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro-vision']
+                    parsed_data = None
+                    last_error = None
                     
-                    # 寫入資料庫
-                    with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
-                            VALUES (:h, :a, :hs, :aws, :dj, :ca)
-                        """), {
-                            "h": parsed_data.get('home_team', ''),
-                            "a": parsed_data.get('away_team', ''),
-                            "hs": parsed_data.get('home_score', 0),
-                            "aws": parsed_data.get('away_score', 0),
-                            "dj": json.dumps(parsed_data),
-                            "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                    st.success("✅ AI 成功識別數據並儲存至資料庫！")
-                    st.session_state['current_parsed_match'] = parsed_data
+                    for model_name in models_to_try:
+                        try:
+                            model = genai.GenerativeModel(model_name)
+                            response = model.generate_content([prompt, img])
+                            raw_text = response.text.strip().replace("```json", "").replace("```", "")
+                            parsed_data = json.loads(raw_text)
+                            break  # 成功解析則跳出迴圈
+                        except Exception as e:
+                            last_error = e
+                            continue
+                            
+                    if not parsed_data:
+                        st.error(f"圖片識別解析失敗 (已嘗試所有模型均失敗)。最後錯誤: {last_error}")
+                    else:
+                        # 寫入資料庫
+                        with engine.begin() as conn:
+                            conn.execute(text("""
+                                INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
+                                VALUES (:h, :a, :hs, :aws, :dj, :ca)
+                            """), {
+                                "h": parsed_data.get('home_team', ''),
+                                "a": parsed_data.get('away_team', ''),
+                                "hs": parsed_data.get('home_score', 0),
+                                "aws": parsed_data.get('away_score', 0),
+                                "dj": json.dumps(parsed_data),
+                                "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                        st.success("✅ AI 成功識別數據並儲存至資料庫！")
+                        st.session_state['current_parsed_match'] = parsed_data
                 except Exception as e:
-                    st.error(f"圖片識別解析失敗: {e}")
+                    st.error(f"系統處理圖片時發生錯誤: {e}")
 
         # 顯示解析好的最新賽事或歷史記錄
         parsed_data = st.session_state.get('current_parsed_match', None)
