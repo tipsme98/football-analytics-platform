@@ -39,7 +39,7 @@ if DATABASE_URL:
     try:
         url = DATABASE_URL
         if "db." in url and ".supabase.co" in url:
-            db_connection_warning = "⚠️️ 偵測到 Supabase 直連網址。Streamlit Cloud 不支援 IPv6，建議使用包含 pooler.supabase.com 與 Port 6543 的 Connection Pooling 網址。"
+            db_connection_warning = "⚠ 偵測到 Supabase 直連網址。Streamlit Cloud 不支援 IPv6，建議使用包含 pooler.supabase.com 與 Port 6543 的 Connection Pooling 網址。"
         
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -117,12 +117,13 @@ if HAS_GENAI and GEMINI_API_KEY:
 def get_best_gemini_model():
     try:
         available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        for pref in ['models/gemini-2.5-flash', 'models/gemini-1.5-flash', 'models/gemini-1.5-pro']:
+        # 更新為優先使用 gemini-3.8-flash 解決 404 錯誤
+        for pref in ['models/gemini-3.8-flash', 'models/gemini-1.5-flash', 'models/gemini-1.5-pro']:
             if pref in available_models:
                 return pref
-        return available_models[0] if available_models else 'models/gemini-1.5-flash'
+        return available_models[0] if available_models else 'models/gemini-3.8-flash'
     except:
-        return 'models/gemini-1.5-flash'
+        return 'models/gemini-3.8-flash'
 
 # --- 4. 輔助函數 ---
 def format_asian_handicap(line):
