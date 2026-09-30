@@ -27,19 +27,35 @@ THE_ODDS_API_KEY = get_secret("THE_ODDS_API_KEY")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 DATABASE_URL = get_secret("DATABASE_URL")
 
-# --- 2. 雲端/本地 資料庫連線配置 ---
+# --- 2. 雲端/本地 資料庫連線配置 (含安全降級容錯機制) ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if DATABASE_URL:
-    # 支援 Supabase / Neon 等 PostgreSQL 雲端資料庫
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-else:
-    # 備用：本地 SQLite 資料庫
-    db_path = os.path.join(CURRENT_DIR, "football_data.db")
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={'check_same_thread': False})
+db_path = os.path.join(CURRENT_DIR, "football_data.db")
+sqlite_engine = create_engine(f"sqlite:///{db_path}", connect_args={'check_same_thread': False})
 
-# --- 3. 自動初始化資料庫（解決 no such table 錯誤）---
+engine = sqlite_engine
+db_connection_warning = None
+
+if DATABASE_URL:
+    try:
+        url = DATABASE_URL
+        if "db." in url and ".supabase.co" in url:
+            db_connection_warning = "⚠️️ 偵測到 Supabase 直連網址。Streamlit Cloud 不支援 IPv6，建議使用包含 pooler.supabase.com 與 Port 6543 的 Connection Pooling 網址。"
+        
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+        elif url.startswith("postgresql://"):
+            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        
+        temp_engine = create_engine(url, pool_pre_ping=True)
+        with temp_engine.connect() as conn:
+            pass
+        engine = temp_engine
+        db_connection_warning = None
+    except Exception as e:
+        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗（如密碼包含特殊字元，請在 Secrets 中加上單引號），已自動切換回本地 SQLite。詳細錯誤: {e}"
+        engine = sqlite_engine
+
+# --- 3. 自動初始化資料庫表架構 ---
 def init_db():
     with engine.begin() as conn:
         conn.execute(text("""
@@ -90,11 +106,23 @@ def init_db():
             )
         """))
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error(f"資料庫初始化失敗: {e}")
 
-# 配置 Gemini
 if HAS_GENAI and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+def get_best_gemini_model():
+    try:
+        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+        for pref in ['models/gemini-2.5-flash', 'models/gemini-1.5-flash', 'models/gemini-1.5-pro']:
+            if pref in available_models:
+                return pref
+        return available_models[0] if available_models else 'models/gemini-1.5-flash'
+    except:
+        return 'models/gemini-1.5-flash'
 
 # --- 4. 輔助函數 ---
 def format_asian_handicap(line):
@@ -117,9 +145,9 @@ def format_ou_line(line):
     except: return str(line)
 
 def render_trend(open_odd, curr_odd):
-    if pd.isna(open_odd) or pd.isna(curr_odd) or open_odd == curr_odd: return ""
-    if curr_odd < open_odd: return f"<span style='color:red;'>⬇ {curr_odd}</span> <span style='font-size:0.7em;color:#999;'>(初: {open_odd})</span>"
-    return f"<span style='color:green;'>⬆ {curr_odd}</span> <span style='font-size:0.7em;color:#999;'>(初: {open_odd})</span>"
+    if pd.isna(open_odd) or pd.isna(curr_odd) or open_odd == curr_odd: return str(curr_odd or '-')
+    if float(curr_odd) < float(open_odd): return f"<span style='color:red;'>⬇ {curr_odd}</span> <span style='font-size:0.75em;color:#888;'>(初: {open_odd})</span>"
+    return f"<span style='color:green;'>⬆ {curr_odd}</span> <span style='font-size:0.75em;color:#888;'>(初: {open_odd})</span>"
 
 # --- 5. 資金流預測引擎 ---
 class SmartOddsPredictor:
@@ -138,7 +166,7 @@ class SmartOddsPredictor:
                 open_data = f_odds.iloc[0]
                 curr_data = f_odds.iloc[-1]
                 
-                home_odd_drop = open_data['ah_home_odd'] - curr_data['ah_home_odd']
+                home_odd_drop = float(open_data['ah_home_odd'] or 0) - float(curr_data['ah_home_odd'] or 0)
                 prob_h = 0.5 + (home_odd_drop * 0.3) 
                 is_value = abs(home_odd_drop) > 0.15 
                 
@@ -160,7 +188,7 @@ class SmartOddsPredictor:
         except Exception: 
             return False
 
-# --- 6. 介面樣式 ---
+# --- 6. 介面樣式與版面配置 ---
 st.set_page_config(page_title="專業足球精算平台", page_icon="⚽", layout="wide")
 
 st.markdown("""
@@ -173,24 +201,20 @@ st.markdown("""
     
     .match-header-dark { background-color: #1a1d24; color: white; padding: 20px; border-radius: 8px; text-align: center; font-family: sans-serif; }
     .match-title { font-size: 14px; color: #ffcc00; margin-bottom: 15px; }
-    .team-name { font-size: 24px; font-weight: bold; display: inline-block; vertical-align: middle; margin: 0 15px; }
-    .score-large { font-size: 36px; font-weight: bold; color: #ffcc00; display: inline-block; vertical-align: middle; margin: 0 20px; }
-    .match-status { display: inline-block; text-align: center; vertical-align: middle; }
-    .status-text { font-size: 20px; font-weight: bold; color: #ffcc00; }
-    .cards-corners { font-size: 12px; margin-top: 5px; }
-    .yellow-card { color: #f59e0b; margin: 0 5px; }
-    .red-card { color: #ef4444; margin: 0 5px; }
-    .corner-flag { color: #10b981; margin: 0 5px; }
-    .ht-score { font-size: 14px; color: #ffcc00; margin-top: 5px; }
+    .team-name { font-size: 22px; font-weight: bold; display: inline-block; vertical-align: middle; margin: 0 15px; }
+    .score-large { font-size: 32px; font-weight: bold; color: #ffcc00; display: inline-block; vertical-align: middle; margin: 0 15px; }
     
     .stats-container { background-color: #151a22; padding: 20px; border-radius: 8px; color: white; margin-top: 15px; }
-    .stats-title { font-size: 16px; font-weight: bold; margin-bottom: 20px; border-bottom: 1px solid #2d3748; padding-bottom: 10px;}
+    .stats-title { font-size: 16px; font-weight: bold; margin-bottom: 15px; border-bottom: 1px solid #2d3748; padding-bottom: 8px;}
     </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 (水位追蹤版)</p>', unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
+if db_connection_warning:
+    st.warning(db_connection_warning)
+
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
 
 def get_tag_html(pick):
     if pick != "觀望": return f'<span class="value-bet-tag">💎 投注: {pick}</span>'
@@ -240,7 +264,7 @@ with tab1:
                         line = format_asian_handicap(row.get('curr_ah_line', 0))
                         open_odd = row.get('open_ah_home_odd', 0)
                         curr_odd = row.get('curr_ah_home_odd', 0)
-                        trend_html = render_trend(open_odd, curr_odd) or str(curr_odd)
+                        trend_html = render_trend(open_odd, curr_odd)
                         pick = str(row.get('recommended_pick', '觀望'))
                         st.markdown(f"**勝負盤 (讓球)**")
                         st.markdown(f"<div class='odds-display'>盤口: <b>[{line}]</b> | 主水: {trend_html}</div>", unsafe_allow_html=True)
@@ -249,7 +273,7 @@ with tab1:
                         ou_line = format_ou_line(row.get('curr_ou_line', 2.5))
                         open_ou = row.get('open_ou_over_odd', 0)
                         curr_ou = row.get('curr_ou_over_odd', 0)
-                        trend_ou_html = render_trend(open_ou, curr_ou) or str(curr_ou)
+                        trend_ou_html = render_trend(open_ou, curr_ou)
                         ou_pick = str(row.get('ou_pick', '觀望'))
                         st.markdown(f"**入球大細**")
                         st.markdown(f"<div class='odds-display'>盤口: <b>[{ou_line}]</b> | 大水: {trend_ou_html}</div>", unsafe_allow_html=True)
@@ -265,7 +289,7 @@ with tab1:
 # ==========================================
 with tab2:
     st.markdown("### 🧠 莊家資金流向與盤口預測模型")
-    st.info("💡 系統會學習及分析盤口及賠率隨時間的變化。找出水位異動與賽果的關聯，避開莊家陷阱。")
+    st.info("💡 系統會學習及分析盤口及賠率隨時間的變化，找出水位異動與賽果的關聯，避開莊家陷阱。")
     if st.button("▶️ 執行盤口變化與資金流分析", type="primary"):
         with st.spinner("正在比對初盤與即時盤水位..."):
             predictor = SmartOddsPredictor()
@@ -354,78 +378,104 @@ with tab3:
                     st.error(f"API 同步失敗: {e}")
 
 # ==========================================
-# 分頁 4: 📸 賽事圖片智能識別與重構 (Gemini 真正 OCR)
+# 分頁 4: 📸 賽事圖片智能識別與重構 (升級版 Gemini Prompt)
 # ==========================================
 with tab4:
     st.markdown("### 📸 歷史賽事圖片數據抓取與介面重構")
     
     if not HAS_GENAI:
-        st.error("⚠️ 缺少 AI 套件，請在 GitHub `requirements.txt` 中加入 `google-generativeai` 與 `Pillow`。")
+        st.error("⚠️ 缺少 AI 套件，請確認已安裝 `google-generativeai` 與 `Pillow`。")
     elif not GEMINI_API_KEY:
-        st.warning("⚠️ 未設定 `GEMINI_API_KEY`，請在 Streamlit Secrets 中填寫。")
+        st.warning("⚠️ 未設定 `GEMINI_API_KEY`，請至 Streamlit Secrets 填寫。")
     else:
-        st.info("上傳賽果截圖，系統將透過 Gemini AI 自動提取真實數據並記錄於雲端資料庫。")
+        st.info("上傳包含比分、技術統計或賠率水位變化的賽事截圖，Gemini 將精確結構化提取資料。")
         uploaded_files = st.file_uploader("上傳賽事截圖", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
         if uploaded_files and st.button("🚀 開始 Gemini 智能識別與重構 UI", type="primary"):
-            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據..."):
+            best_model_name = get_best_gemini_model()
+            with st.spinner(f"🧠 Gemini 正在使用模型 `{best_model_name}` 結構化解析截圖..."):
                 try:
                     img = Image.open(uploaded_files[0])
-                    model = genai.GenerativeModel('gemini-1.5-flash')
                     
+                    # 升級版 Gemini 專家級 Prompt
                     prompt = """
-                    請精確提取這張足球比賽截圖中的資訊，並嚴格只回傳純 JSON 格式（不要Markdown括號或其餘文字）：
+                    你是一個專業足球數據與體育博彩數據分析 AI。請仔細分析這張足球比賽網頁截圖（包含聯賽名稱、隊伍、比分、黃/紅牌、角球、進攻/危險進攻/控球率等技術統計，以及讓球盤口與大細球盤口的水位變化）。
+
+                    請提取所有數據並嚴格只回傳 JSON 格式（絕對不要包含 Markdown 程式碼標記、註解或額外文字）：
                     {
-                      "league": "聯賽名稱",
-                      "datetime": "比賽時間",
+                      "league": "聯賽名稱（例如：意甲、英超、西甲等）",
+                      "datetime": "比賽時間（例如：2026-09-30 20:00）",
                       "home_team": "主隊名稱",
                       "away_team": "客隊名稱",
-                      "home_score": 主隊得分數字,
-                      "away_score": 客隊得分數字,
-                      "ht_score": "半場比分如 2-0",
-                      "home_yellow": 主隊黃牌數,
-                      "away_yellow": 客隊黃牌數,
-                      "home_red": 主隊紅牌數,
-                      "away_red": 客隊紅牌數,
-                      "home_corner": 主隊角球數,
-                      "away_corner": 客隊角球數,
+                      "home_score": 主隊最終得分數字,
+                      "away_score": 客隊最終得分數字,
+                      "ht_score": "半場比分（例如：1-0，若無則填 '-'）",
+                      "home_yellow": 主隊黃牌數數字,
+                      "away_yellow": 客隊黃牌數數字,
+                      "home_red": 主隊紅牌數數字,
+                      "away_red": 客隊紅牌數數字,
+                      "home_corner": 主隊角球數數字,
+                      "away_corner": 客隊角球數數字,
                       "stats": {
-                        "attacks": [主隊進攻, 客隊進攻],
-                        "dangerous_attacks": [主隊危險進攻, 客隊危險進攻],
-                        "possession": [主隊控球率, 客隊控球率],
-                        "shots_on_target": [主隊射正, 客隊射正],
-                        "shots_off_target": [主隊射斜, 客隊射斜],
-                        "penalties": [主隊點球, 客隊點球],
-                        "blocked_shots": [主隊被擋, 客隊被擋]
+                        "attacks": [主隊進攻數, 客隊進攻數],
+                        "dangerous_attacks": [主隊危險進攻數, 客隊危險進攻數],
+                        "possession": [主隊控球率數字, 客隊控球率數字],
+                        "shots_on_target": [主隊射正數, 客隊射正數],
+                        "shots_off_target": [主隊射偏數, 客隊射偏數]
+                      },
+                      "odds_trend": {
+                        "ah_line": "讓球盤口（例如：0, -0.5, +0.5/1，若未顯示填 '0'）",
+                        "home_initial_odd": 主隊讓球初盤水位數字（例如 0.95，若無填 0）,
+                        "home_current_odd": 主隊讓球即時水位數字（例如 0.88，若無填 0）,
+                        "away_initial_odd": 客隊讓球初盤水位數字（例如 0.91，若無填 0）,
+                        "away_current_odd": 客隊讓球即時水位數字（例如 0.98，若無填 0）,
+                        "ou_line": "大細球盤口（例如：2.5, 2.75, 3，若未顯示填 '2.5'）",
+                        "ou_over_initial": 大球初盤水位數字（例如 0.85，若無填 0）,
+                        "ou_over_current": 大球即時水位數字（例如 0.92，若無填 0）,
+                        "ou_under_initial": 細球初盤水位數字（例如 0.95，若無填 0）,
+                        "ou_under_current": 細球即時水位數字（例如 0.88，若無填 0）
                       }
                     }
+
+                    【注意事項】
+                    1. 若圖片中找不到特定數字欄位，請用數字 0 替代，字串用 'N/A'，嚴禁輸出 null 或未定義值。
+                    2. 數字請確保為純整數或浮點數（例如: 0.95 而非 "0.95"）。
                     """
+                    
+                    model = genai.GenerativeModel(best_model_name)
                     response = model.generate_content([prompt, img])
-                    raw_text = response.text.strip().replace("```json", "").replace("```", "")
+                    raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
+                    
+                    # 擷取標準 JSON 區塊
+                    start_idx = raw_text.find('{')
+                    end_idx = raw_text.rfind('}')
+                    if start_idx != -1 and end_idx != -1:
+                        raw_text = raw_text[start_idx:end_idx+1]
+                        
                     parsed_data = json.loads(raw_text)
                     
-                    # 寫入雲端/本地資料庫
-                    with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
-                            VALUES (:h, :a, :hs, :aws, :dj, :ca)
-                        """), {
-                            "h": parsed_data.get('home_team', ''),
-                            "a": parsed_data.get('away_team', ''),
-                            "hs": parsed_data.get('home_score', 0),
-                            "aws": parsed_data.get('away_score', 0),
-                            "dj": json.dumps(parsed_data),
-                            "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                    st.success("✅ AI 成功識別數據並儲存至雲端資料庫！")
-                    st.session_state['current_parsed_match'] = parsed_data
+                    if parsed_data:
+                        with engine.begin() as conn:
+                            conn.execute(text("""
+                                INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
+                                VALUES (:h, :a, :hs, :aws, :dj, :ca)
+                            """), {
+                                "h": parsed_data.get('home_team', '未知主隊'),
+                                "a": parsed_data.get('away_team', '未知客隊'),
+                                "hs": int(parsed_data.get('home_score') or 0),
+                                "aws": int(parsed_data.get('away_score') or 0),
+                                "dj": json.dumps(parsed_data),
+                                "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                        st.success("✅ AI 成功識別截圖所有數據（含讓球/大細水位變化）並儲存至資料庫！")
+                        st.session_state['current_parsed_match'] = parsed_data
+                    else:
+                        st.error("解析出來的資料為空。")
                 except Exception as e:
-                    st.error(f"圖片識別解析失敗: {e}")
+                    st.error(f"系統處理圖片時發生錯誤。模型: {best_model_name}。錯誤訊息: {e}")
 
-        # 顯示解析好的最新賽事或歷史記錄
+        # 呈現解析後的資料與動態表格
         parsed_data = st.session_state.get('current_parsed_match', None)
-        
-        # 若當前 session 無數據，自動從資料庫讀取最新的截圖紀錄
         if not parsed_data:
             try:
                 db_record = pd.read_sql("SELECT data_json FROM historical_match_stats ORDER BY id DESC LIMIT 1", engine)
@@ -440,15 +490,16 @@ with tab4:
                 <div>
                     <div class="team-name">{parsed_data.get('home_team','')}</div>
                     <div class="score-large">{parsed_data.get('home_score',0)}</div>
-                    <div class="match-status">
-                        <div class="status-text">完'</div>
-                        <div class="cards-corners">
-                            <span class="yellow-card">🟨 {parsed_data.get('home_yellow',0)}</span>
-                            <span class="red-card">🟥 {parsed_data.get('home_red',0)}</span>
-                            <span class="corner-flag">🚩 {parsed_data.get('home_corner',0)} - {parsed_data.get('away_corner',0)}</span>
-                            <span class="yellow-card">🟨 {parsed_data.get('away_yellow',0)}</span>
+                    <div style="display:inline-block; text-align:center; vertical-align:middle; margin: 0 15px;">
+                        <div style="font-size:18px; font-weight:bold; color:#ffcc00;">完</div>
+                        <div style="font-size:12px; margin-top:4px;">
+                            <span style="color:#f59e0b;">🟨 {parsed_data.get('home_yellow',0)}</span>
+                            <span style="color:#ef4444; margin-left:4px;">🟥 {parsed_data.get('home_red',0)}</span>
+                            <span style="color:#10b981; margin-left:8px;">🚩 {parsed_data.get('home_corner',0)} - {parsed_data.get('away_corner',0)}</span>
+                            <span style="color:#f59e0b; margin-left:8px;">🟨 {parsed_data.get('away_yellow',0)}</span>
+                            <span style="color:#ef4444; margin-left:4px;">🟥 {parsed_data.get('away_red',0)}</span>
                         </div>
-                        <div class="ht-score">HT: ({parsed_data.get('ht_score','-')})</div>
+                        <div style="font-size:12px; color:#ffcc00; margin-top:4px;">HT: ({parsed_data.get('ht_score','-')})</div>
                     </div>
                     <div class="score-large">{parsed_data.get('away_score',0)}</div>
                     <div class="team-name">{parsed_data.get('away_team','')}</div>
@@ -456,26 +507,52 @@ with tab4:
             </div>
             """, unsafe_allow_html=True)
             
-            sub_tab1, sub_tab2 = st.tabs(["📊 技術統計", "📜 歷史記錄庫"])
+            sub_tab1, sub_tab2, sub_tab3 = st.tabs(["📊 技術統計", "📈 盤口與水位變化表", "📜 歷史記錄庫"])
             
             with sub_tab1:
                 s = parsed_data.get('stats', {})
                 att = s.get('attacks', [0, 0])
                 d_att = s.get('dangerous_attacks', [0, 0])
                 pos = s.get('possession', [50, 50])
+                shots_on = s.get('shots_on_target', [0, 0])
+                shots_off = s.get('shots_off_target', [0, 0])
                 
                 st.markdown(f"""
                 <div class="stats-container">
                     <div class="stats-title">比賽技術數據分析</div>
-                    <div style="display:flex; justify-content:space-around; text-align:center; margin-bottom: 20px;">
+                    <div style="display:flex; justify-content:space-around; text-align:center; margin-bottom:15px;">
                         <div><div style="color:#94a3b8; font-size:12px;">進攻</div><div style="font-size:18px;">{att[0]} vs {att[1]}</div></div>
                         <div><div style="color:#94a3b8; font-size:12px;">危險進攻</div><div style="font-size:18px;">{d_att[0]} vs {d_att[1]}</div></div>
                         <div><div style="color:#94a3b8; font-size:12px;">控球率</div><div style="font-size:18px;">{pos[0]}% vs {pos[1]}%</div></div>
+                    </div>
+                    <div style="display:flex; justify-content:space-around; text-align:center;">
+                        <div><div style="color:#94a3b8; font-size:12px;">射正</div><div style="font-size:18px;">{shots_on[0]} vs {shots_on[1]}</div></div>
+                        <div><div style="color:#94a3b8; font-size:12px;">射偏</div><div style="font-size:18px;">{shots_off[0]} vs {shots_off[1]}</div></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
 
             with sub_tab2:
+                st.markdown("#### 📊 莊家盤口與水位變化即時對比")
+                ot = parsed_data.get('odds_trend', {})
+                
+                df_odds_table = pd.DataFrame([
+                    {
+                        "玩法類型": "讓球盤 (AH)", 
+                        "盤口": ot.get('ah_line', '0'), 
+                        "初盤水位 (主 / 客)": f"{ot.get('home_initial_odd', '-')} / {ot.get('away_initial_odd', '-')}", 
+                        "即時/終盤水位 (主 / 客)": f"{ot.get('home_current_odd', '-')} / {ot.get('away_current_odd', '-')}"
+                    },
+                    {
+                        "玩法類型": "入球大細 (OU)", 
+                        "盤口": ot.get('ou_line', '2.5'), 
+                        "初盤水位 (大 / 細)": f"{ot.get('ou_over_initial', '-')} / {ot.get('ou_under_initial', '-')}", 
+                        "即時/終盤水位 (大 / 細)": f"{ot.get('ou_over_current', '-')} / {ot.get('ou_under_current', '-')}"
+                    }
+                ])
+                st.table(df_odds_table)
+
+            with sub_tab3:
                 try:
                     df_h = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, created_at FROM historical_match_stats ORDER BY id DESC", engine)
                     st.dataframe(df_h, use_container_width=True)
