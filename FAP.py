@@ -115,15 +115,8 @@ if HAS_GENAI and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 def get_best_gemini_model():
-    try:
-        available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-        # 更新為優先使用 gemini-3.8-flash 解決 404 錯誤
-        for pref in ['models/gemini-3.8-flash', 'models/gemini-1.5-flash', 'models/gemini-1.5-pro']:
-            if pref in available_models:
-                return pref
-        return available_models[0] if available_models else 'models/gemini-3.8-flash'
-    except:
-        return 'models/gemini-3.8-flash'
+    # ⚠️ 修正卡死問題：移除 genai.list_models() 的動態網路請求，強制指定目前最穩定的官方模型
+    return 'models/gemini-1.5-flash'
 
 # --- 4. 輔助函數 ---
 def format_asian_handicap(line):
@@ -396,7 +389,8 @@ with tab4:
             best_model_name = get_best_gemini_model()
             with st.spinner(f"🧠 Gemini 正在使用模型 `{best_model_name}` 結構化解析截圖..."):
                 try:
-                    img = Image.open(uploaded_files[0])
+                    # ⚠️ 修正卡死問題：強制轉換為 RGB 模式，避免特殊編碼或透明背景的 PNG 卡死 Gemini 解析器
+                    img = Image.open(uploaded_files[0]).convert('RGB')
                     
                     # 升級版 Gemini 專家級 Prompt
                     prompt = """
