@@ -27,19 +27,31 @@ THE_ODDS_API_KEY = get_secret("THE_ODDS_API_KEY")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 DATABASE_URL = get_secret("DATABASE_URL")
 
-# --- 2. 雲端/本地 資料庫連線配置 ---
+# --- 2. 雲端/本地 資料庫連線配置 (含安全降級容錯機制) ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if DATABASE_URL:
-    # 支援 Supabase / Neon 等 PostgreSQL 雲端資料庫
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-else:
-    # 備用：本地 SQLite 資料庫
-    db_path = os.path.join(CURRENT_DIR, "football_data.db")
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={'check_same_thread': False})
+db_path = os.path.join(CURRENT_DIR, "football_data.db")
+sqlite_engine = create_engine(f"sqlite:///{db_path}", connect_args={'check_same_thread': False})
 
-# --- 3. 自動初始化資料庫（解決 no such table 錯誤）---
+engine = sqlite_engine
+db_connection_warning = None
+
+if DATABASE_URL:
+    try:
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        
+        # 嘗試使用 psycopg2/postgresql 引擎
+        temp_engine = create_engine(url, pool_pre_ping=True)
+        # 測試測試連線
+        with temp_engine.connect() as conn:
+            pass
+        engine = temp_engine
+    except Exception as e:
+        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗 (可能缺少 psycopg2-binary 套件)，已自動切換回本地 SQLite。詳細錯誤: {e}"
+        engine = sqlite_engine
+
+# --- 3. 自動初始化資料庫表架構 ---
 def init_db():
     with engine.begin() as conn:
         conn.execute(text("""
@@ -90,7 +102,10 @@ def init_db():
             )
         """))
 
-init_db()
+try:
+    init_db()
+except Exception as e:
+    st.error(f"資料庫初始化失敗: {e}")
 
 # 配置 Gemini
 if HAS_GENAI and GEMINI_API_KEY:
@@ -189,6 +204,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 (水位追蹤版)</p>', unsafe_allow_html=True)
+
+if db_connection_warning:
+    st.warning(db_connection_warning)
 
 tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
 
@@ -404,7 +422,7 @@ with tab4:
                     raw_text = response.text.strip().replace("```json", "").replace("```", "")
                     parsed_data = json.loads(raw_text)
                     
-                    # 寫入雲端/本地資料庫
+                    # 寫入資料庫
                     with engine.begin() as conn:
                         conn.execute(text("""
                             INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
@@ -417,7 +435,7 @@ with tab4:
                             "dj": json.dumps(parsed_data),
                             "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         })
-                    st.success("✅ AI 成功識別數據並儲存至雲端資料庫！")
+                    st.success("✅ AI 成功識別數據並儲存至資料庫！")
                     st.session_state['current_parsed_match'] = parsed_data
                 except Exception as e:
                     st.error(f"圖片識別解析失敗: {e}")
@@ -425,7 +443,6 @@ with tab4:
         # 顯示解析好的最新賽事或歷史記錄
         parsed_data = st.session_state.get('current_parsed_match', None)
         
-        # 若當前 session 無數據，自動從資料庫讀取最新的截圖紀錄
         if not parsed_data:
             try:
                 db_record = pd.read_sql("SELECT data_json FROM historical_match_stats ORDER BY id DESC LIMIT 1", engine)
