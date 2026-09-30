@@ -169,7 +169,7 @@ def merge_match_json(old_data, new_data):
     for k, new_v in new_data.items():
         old_v = merged.get(k)
 
-        # 若是字典（如 stats, odds_trend, recent_form），進行深層合併
+        # 若是字典（如 stats, odds_history, recent_form），進行深層合併
         if isinstance(new_v, dict) and isinstance(old_v, dict):
             merged_dict = dict(old_v)
             for sub_k, sub_v in new_v.items():
@@ -544,16 +544,11 @@ with tab4:
                 images = [Image.open(file).convert('RGB') for file in uploaded_files]
                 
                 prompt = """
-                你是一個專業足球數據與體育博彩數據分析 AI。你將會收到一張或多張關於同一場賽事（或相關賽事）的截圖，內容可能包含：
-                1. 賽果比分與基本資訊（聯賽名稱、時間、主隊、客隊、半全場比分、黃/紅牌、角球）。
-                2. 詳細技術統計（進攻、危險進攻、控球率、射正、射斜、點球、被擋射門等）。
-                3. 莊家盤口與水位變化表（讓球盤口與初盤/即時水位、大細球盤口與初盤/即時水位、水位走勢紀錄）。
-                4. 主隊與客隊近況戰績 / 歷史交鋒對賽紀錄。
-
-                請綜合所有提供的截圖，精確結構化提取資料，並嚴格只回傳 JSON 格式（絕對不要包含 Markdown 程式碼標記、註解或額外文字）：
+                你是一個專業足球數據與體育博彩數據分析 AI。你將會收到多張關於同一場賽事（或相關賽事）的截圖。
+                請綜合所有圖片提取資料，嚴格只回傳 JSON 格式（絕對不要包含 Markdown 程式碼標記、註解或額外文字）：
                 {
-                  "league": "聯賽名稱（例如：歐洲國家聯賽、英超、西甲等）",
-                  "datetime": "比賽日期時間（格式為 YYYY-MM-DD HH:MM，例如：2026-09-30 02:45；若未顯示年份請預設為 2026 年）",
+                  "league": "聯賽名稱",
+                  "datetime": "比賽日期時間 YYYY-MM-DD HH:MM",
                   "home_team": "主隊名稱",
                   "away_team": "客隊名稱",
                   "home_score": 主隊最終得分數字,
@@ -572,26 +567,25 @@ with tab4:
                     "shots_on_target": [主隊射正數, 客隊射正數],
                     "shots_off_target": [主隊射偏數, 客隊射偏數]
                   },
-                  "odds_trend": {
-                    "ah_line": "讓球盤口（例如：[-1.5/-2], [-2], 0，若未顯示填 '0'）",
-                    "home_initial_odd": 主隊讓球初盤水位數字（例如 1.83，若無填 0）,
-                    "home_current_odd": 主隊讓球即時/終盤水位數字（例如 1.98，若無填 0）,
-                    "away_initial_odd": 客隊讓球初盤水位數字（例如 1.93，若無填 0）,
-                    "away_current_odd": 客隊讓球即時/終盤水位數字（例如 1.82，若無填 0）,
-                    "ou_line": "大細球盤口（例如：2.5, 2.75, 3，若未顯示填 '2.5'）",
-                    "ou_over_initial": 大球初盤水位數字（例如 1.85，若無填 0）,
-                    "ou_over_current": 大球即時水位數字（例如 1.95，若無填 0）,
-                    "ou_under_initial": 細球初盤水位數字（例如 1.95，若無填 0）,
-                    "ou_under_current": 細球即時水位數字（例如 1.85，若無填 0）
+                  "odds_history": {
+                    "ah": [
+                      {"time": "MM-DD HH:MM", "home": 1.83, "line": "[-1.5/-2]", "away": 1.93}
+                    ],
+                    "ou": [
+                      {"time": "MM-DD HH:MM", "over": 1.95, "line": "[3.0/3.5]", "under": 1.75}
+                    ],
+                    "corners": [
+                      {"time": "MM-DD HH:MM", "over": 2.17, "line": "[9.5]", "under": 1.61}
+                    ]
                   },
                   "recent_form": {
                     "home_recent": ["主隊近況戰績摘要列表，如：26-09-27 歐國聯 vs 英格蘭 2-3"],
                     "away_recent": ["客隊近況戰績摘要列表，如：26-09-27 歐國聯 vs 捷克 1-2"]
                   }
                 }
-
+                
                 【注意事項】
-                1. 請整合所有上傳圖片中的訊息。若有盤口變化截圖，初盤請採最早時間之水位，終盤/即時盤請採最晚時間之水位。
+                1. 必須將圖片中「所有」的時間、盤口及水位變化完整列入 odds_history 陣列中，不能只取首尾。若無角球盤口圖片，"corners" 回傳空陣列 []。
                 2. 若圖片中找不到特定數字欄位，請用數字 0 替代，字串用 'N/A'，嚴禁輸出 null 或未定義值。
                 3. 數字請確保為純整數或浮點數（例如: 1.83 而非 "1.83"）。
                 4. datetime 請務必確保格式包含完整年份（如 2026-09-30 02:45）。
@@ -606,205 +600,4 @@ with tab4:
                         with st.spinner(f"🧠 嘗試使用 Gemini 模型 ({model_name}) 進行跨圖解析..."):
                             model = genai.GenerativeModel(model_name)
                             response = model.generate_content([prompt] + images)
-                            raw_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-                            
-                            start_idx = raw_text.find('{')
-                            end_idx = raw_text.rfind('}')
-                            if start_idx != -1 and end_idx != -1:
-                                raw_text = raw_text[start_idx:end_idx+1]
-                                
-                            parsed_data = json.loads(raw_text)
-                            if parsed_data:
-                                st.toast(f"✅ 成功調用模型：{model_name}")
-                                break
-                    except Exception as e:
-                        last_error = e
-                        continue
-                
-                if parsed_data:
-                    parsed_dt = parsed_data.get('datetime', '')
-                    parsed_data['datetime'] = parsed_dt if parsed_dt else datetime.now().strftime("%Y-%m-%d %H:%M")
-                    
-                    if op_mode == "🔄 更新 / 補充已有賽事紀錄" and selected_existing_id:
-                        # 執行數據合併：將 new_data 覆蓋/增補到 existing_record_json
-                        merged_data = merge_match_json(existing_record_json, parsed_data)
-                        
-                        try:
-                            with engine.begin() as conn:
-                                conn.execute(text("""
-                                    UPDATE historical_match_stats
-                                    SET home_team = :h,
-                                        away_team = :a,
-                                        home_score = :hs,
-                                        away_score = :aws,
-                                        data_json = :dj
-                                    WHERE id = :id
-                                """), {
-                                    'h': merged_data.get('home_team', '未知主隊'),
-                                    'a': merged_data.get('away_team', '未知客隊'),
-                                    'hs': int(merged_data.get('home_score') or 0),
-                                    'aws': int(merged_data.get('away_score') or 0),
-                                    'dj': json.dumps(merged_data, ensure_ascii=False),
-                                    'id': selected_existing_id
-                                })
-                            st.success(f"✅ 已成功將 {len(uploaded_files)} 張新圖片的數據合併至該賽事紀錄（補齊缺項並更新舊數據）！")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"資料庫更新失敗: {e}")
-
-                    else:
-                        # 全新賽事紀錄新增
-                        try:
-                            with engine.begin() as conn:
-                                conn.execute(text("""
-                                    INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
-                                    VALUES (:h, :a, :hs, :aws, :dj, :ca)
-                                """), {
-                                    'h': parsed_data.get('home_team', '未知主隊'),
-                                    'a': parsed_data.get('away_team', '未知客隊'),
-                                    'hs': int(parsed_data.get('home_score') or 0),
-                                    'aws': int(parsed_data.get('away_score') or 0),
-                                    'dj': json.dumps(parsed_data, ensure_ascii=False),
-                                    'ca': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                })
-                            st.success(f"✅ AI 成功識別並整合了 {len(uploaded_files)} 張截圖數據，已新增至數據庫！")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"資料庫寫入失敗: {e}")
-                else:
-                    st.error(f"所有 Gemini 模型嘗試皆失敗。最後錯誤訊息: {last_error}")
-
-    st.divider()
-    st.markdown("### 📅 歷史賽事紀錄查詢")
-    
-    try:
-        df_history = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, data_json, created_at FROM historical_match_stats ORDER BY id DESC", engine)
-    except Exception:
-        df_history = pd.DataFrame()
-        
-    if not df_history.empty:
-        record_list = []
-        for _, row in df_history.iterrows():
-            try:
-                dj = json.loads(row['data_json']) if row.get('data_json') and pd.notna(row['data_json']) else {}
-            except Exception:
-                dj = {}
-            
-            raw_dt = dj.get('datetime')
-            raw_ca = row.get('created_at')
-            
-            date_str = normalize_to_yyyy_mm_dd(raw_dt, fallback_dt=raw_ca)
-            match_time_display = str(raw_dt).strip() if (raw_dt and pd.notna(raw_dt)) else str(raw_ca).strip()
-            
-            record_list.append({
-                'id': row['id'],
-                'record_date': date_str,
-                'league': dj.get('league', '未知聯賽'),
-                'match_time': match_time_display,
-                'home_team': dj.get('home_team', row.get('home_team', '未知主隊')),
-                'away_team': dj.get('away_team', row.get('away_team', '未知客隊')),
-                'score': f"{dj.get('home_score', row.get('home_score', 0))} - {dj.get('away_score', row.get('away_score', 0))}",
-                'data_json': dj
-            })
-            
-        df_records = pd.DataFrame(record_list)
-        available_dates = sorted(list(df_records['record_date'].unique()), reverse=True)
-        
-        col_date, _ = st.columns([1, 2])
-        with col_date:
-            selected_date = st.selectbox("📅 請選擇查詢日期：", available_dates)
-            
-        day_matches = df_records[df_records['record_date'] == selected_date]
-        
-        st.markdown(f"#### 📋 {selected_date} 已記錄賽事列表")
-        summary_table = day_matches[['match_time', 'league', 'home_team', 'score', 'away_team']].copy()
-        summary_table.columns = ['比賽時間', '聯賽名稱', '主隊', '比分', '客隊']
-        st.dataframe(summary_table, use_container_width=True, hide_index=True)
-        
-        st.divider()
-        
-        match_options = {row['id']: f"[{row['league']}] {row['home_team']} vs {row['away_team']} ({row['score']})" for _, row in day_matches.iterrows()}
-        selected_match_id = st.selectbox(
-            "⚽ 請選擇要檢視詳細資料的賽事：",
-            options=list(match_options.keys()),
-            format_func=lambda x: match_options[x]
-        )
-        
-        selected_record = day_matches[day_matches['id'] == selected_match_id].iloc[0]
-        data = selected_record['data_json']
-        
-        sub1, sub2, sub3, sub4 = st.tabs(["📊 技術統計", "📈 盤口與水位變化表", "⚽ 賽果明細", "📜 近況戰績"])
-        
-        with sub1:
-            st.markdown("##### 📊 團隊詳細技術統計")
-            stats = data.get('stats', {}) if isinstance(data.get('stats'), dict) else {}
-            att = stats.get('attacks', [0, 0])
-            d_att = stats.get('dangerous_attacks', [0, 0])
-            pos = stats.get('possession', [0, 0])
-            shots_on = stats.get('shots_on_target', [0, 0])
-            shots_off = stats.get('shots_off_target', [0, 0])
-            
-            df_stats_table = pd.DataFrame([
-                {"技術指標": "進攻次數", "主隊": att[0] if len(att)>0 else 0, "客隊": att[1] if len(att)>1 else 0},
-                {"技術指標": "危險進攻次數", "主隊": d_att[0] if len(d_att)>0 else 0, "客隊": d_att[1] if len(d_att)>1 else 0},
-                {"技術指標": "控球率 (%)", "主隊": f"{pos[0]}%" if len(pos)>0 else "0%", "客隊": f"{pos[1]}%" if len(pos)>1 else "0%"},
-                {"技術指標": "射正次數", "主隊": shots_on[0] if len(shots_on)>0 else 0, "客隊": shots_on[1] if len(shots_on)>1 else 0},
-                {"技術指標": "射偏次數", "主隊": shots_off[0] if len(shots_off)>0 else 0, "客隊": shots_off[1] if len(shots_off)>1 else 0}
-            ])
-            st.table(df_stats_table)
-            
-        with sub2:
-            st.markdown("##### 📈 莊家盤口與水位變化表")
-            ot = data.get('odds_trend', {}) if isinstance(data.get('odds_trend'), dict) else {}
-            
-            df_odds_table = pd.DataFrame([
-                {
-                    "玩法類型": "讓球盤 (AH)",
-                    "盤口": ot.get('ah_line', '0'),
-                    "初盤水位 (主 / 客)": f"{ot.get('home_initial_odd', '-')} / {ot.get('away_initial_odd', '-')}",
-                    "即時/終盤水位 (主 / 客)": f"{ot.get('home_current_odd', '-')} / {ot.get('away_current_odd', '-')}"
-                },
-                {
-                    "玩法類型": "入球大細 (OU)",
-                    "盤口": ot.get('ou_line', '2.5'),
-                    "初盤水位 (大 / 細)": f"{ot.get('ou_over_initial', '-')} / {ot.get('ou_under_initial', '-')}",
-                    "即時/終盤水位 (大 / 細)": f"{ot.get('ou_over_current', '-')} / {ot.get('ou_under_current', '-')}"
-                }
-            ])
-            st.table(df_odds_table)
-            
-        with sub3:
-            st.markdown("##### ⚽ 賽事數據與賽果總覽")
-            df_result_table = pd.DataFrame([
-                {"項目": "賽事聯賽 / 時間", "數據": f"{data.get('league', '-')} ({data.get('datetime', '-')})"},
-                {"項目": "主隊 vs 客隊", "數據": f"{data.get('home_team', '主隊')} vs {data.get('away_team', '客隊')}"},
-                {"項目": "全場最終比分", "數據": f"{data.get('home_score', 0)} - {data.get('away_score', 0)}"},
-                {"項目": "半場比分 (HT)", "數據": str(data.get('ht_score', '-'))},
-                {"項目": "黃牌數 (主隊 / 客隊)", "數據": f"🟨 {data.get('home_yellow', 0)} / 🟨 {data.get('away_yellow', 0)}"},
-                {"項目": "紅牌數 (主隊 / 客隊)", "數據": f"🟥 {data.get('home_red', 0)} / 🟥 {data.get('away_red', 0)}"},
-                {"項目": "角球數 (主隊 / 客隊)", "數據": f"🚩 {data.get('home_corner', 0)} / 🚩 {data.get('away_corner', 0)}"}
-            ])
-            st.table(df_result_table)
-
-        with sub4:
-            st.markdown("##### 📜 近況戰績數據摘要")
-            rf = data.get('recent_form', {}) if isinstance(data.get('recent_form'), dict) else {}
-            h_rec = rf.get('home_recent', [])
-            a_rec = rf.get('away_recent', [])
-            c_h, c_a = st.columns(2)
-            with c_h:
-                st.markdown(f"**主隊 ({data.get('home_team', '主隊')}) 近況戰績**")
-                if h_rec:
-                    for item in h_rec:
-                        st.write(f"- {item}")
-                else:
-                    st.caption("無截圖近況紀錄")
-            with c_a:
-                st.markdown(f"**客隊 ({data.get('away_team', '客隊')}) 近況戰績**")
-                if a_rec:
-                    for item in a_rec:
-                        st.write(f"- {item}")
-                else:
-                    st.caption("無截圖近況紀錄")
-    else:
-        st.info("目前數據庫尚無已記錄的歷史賽事截圖數據。")
+                            raw_text = response.text.strip().replace('```json', '').replace('
