@@ -38,21 +38,26 @@ db_connection_warning = None
 if DATABASE_URL:
     try:
         url = DATABASE_URL
+        
+        # 自動偵測是否使用了錯誤的 IPv6 直連網址
+        if "db." in url and ".supabase.co" in url:
+            db_connection_warning = "⚠️ 偵測到您使用了 Supabase 的直連網址 (db.*.supabase.co)。Streamlit Cloud 不支援 IPv6，這會導致連線失敗。請至 Supabase 改用包含 pooler.supabase.com 且 Port 為 6543 的 Connection Pooling 網址。"
+        
         # 強制指定使用 psycopg2 驅動
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+psycopg2://", 1)
         elif url.startswith("postgresql://"):
             url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
         
-        # 嘗試使用 psycopg2/postgresql 引擎
-        temp_engine = create_engine(url, pool_pre_ping=True)
         # 測試連線
+        temp_engine = create_engine(url, pool_pre_ping=True)
         with temp_engine.connect() as conn:
-            pass
+            pass # 連線成功
         engine = temp_engine
+        db_connection_warning = None # 如果成功就清除警告
     except Exception as e:
-        # 如果 Supabase 暫停或網址錯誤，會在此處被攔截並顯示提示
-        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。請檢查 Streamlit Secrets 中的 DATABASE_URL 是否正確，或 Supabase 專案是否進入暫停(Pause)狀態。詳細錯誤: {e}"
+        if not db_connection_warning:
+            db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。詳細錯誤: {e}"
         engine = sqlite_engine
 
 # --- 3. 自動初始化資料庫表架構 ---
@@ -111,9 +116,28 @@ try:
 except Exception as e:
     st.error(f"資料庫初始化失敗: {e}")
 
-# 配置 Gemini
+# 配置 Gemini API
 if HAS_GENAI and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# --- 動態獲取支援圖片識別的 Gemini 模型 ---
+def get_best_gemini_model():
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        # 優先選擇 flash 其次 pro
+        for pref in ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro-vision']:
+            if pref in available_models:
+                return pref
+        # 若找不到預設名稱，返回列表中第一個支援生成的模型
+        if available_models:
+            return available_models[0]
+        return 'gemini-1.5-flash' # 硬限制的最終回退
+    except:
+        return 'gemini-1.5-flash'
 
 # --- 4. 輔助函數 ---
 def format_asian_handicap(line):
@@ -212,7 +236,7 @@ st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 
 if db_connection_warning:
     st.warning(db_connection_warning)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
 
 def get_tag_html(pick):
     if pick != "觀望": return f'<span class="value-bet-tag">💎 投注: {pick}</span>'
@@ -390,7 +414,11 @@ with tab4:
         uploaded_files = st.file_uploader("上傳賽事截圖", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
         if uploaded_files and st.button("🚀 開始 Gemini 智能識別與重構 UI", type="primary"):
-            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據..."):
+            
+            # 動態獲取可用模型，避免 404 錯誤
+            best_model_name = get_best_gemini_model()
+            
+            with st.spinner(f"🧠 Gemini 正在使用模型 `{best_model_name}` 解析截圖..."):
                 try:
                     img = Image.open(uploaded_files[0])
                     prompt = """
@@ -421,24 +449,14 @@ with tab4:
                     }
                     """
                     
-                    # 實作多重模型容錯機制 (移除已被 Google 棄用的 gemini-pro-vision)
-                    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
-                    parsed_data = None
-                    last_error = None
+                    # 呼叫獲取到的模型
+                    model = genai.GenerativeModel(best_model_name)
+                    response = model.generate_content([prompt, img])
+                    raw_text = response.text.strip().replace("```json", "").replace("```", "")
+                    parsed_data = json.loads(raw_text)
                     
-                    for model_name in models_to_try:
-                        try:
-                            model = genai.GenerativeModel(model_name)
-                            response = model.generate_content([prompt, img])
-                            raw_text = response.text.strip().replace("```json", "").replace("```", "")
-                            parsed_data = json.loads(raw_text)
-                            break  # 成功解析則跳出迴圈
-                        except Exception as e:
-                            last_error = e
-                            continue
-                            
                     if not parsed_data:
-                        st.error(f"圖片識別解析失敗。請確認您的 requirements.txt 已更新 google-generativeai 版本。最後錯誤: {last_error}")
+                        st.error("圖片識別未能返回有效 JSON 數據。")
                     else:
                         # 寫入資料庫
                         with engine.begin() as conn:
@@ -456,7 +474,7 @@ with tab4:
                         st.success("✅ AI 成功識別數據並儲存至資料庫！")
                         st.session_state['current_parsed_match'] = parsed_data
                 except Exception as e:
-                    st.error(f"系統處理圖片時發生錯誤: {e}")
+                    st.error(f"系統處理圖片時發生錯誤。使用的模型: {best_model_name}。錯誤訊息: {e}")
 
         # 顯示解析好的最新賽事或歷史記錄
         parsed_data = st.session_state.get('current_parsed_match', None)
