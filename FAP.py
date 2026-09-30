@@ -394,68 +394,269 @@ def get_tag_html(pick):
     return '<span class="wait-tag">觀望</span>'
 
 # ==========================================
-# 分頁 1: 賽事與即時水位追蹤
+# 分頁 1: 賽事與即時水位追蹤 (含日期選擇與詳細記錄檢索)
 # ==========================================
 with tab1:
-    st.markdown("### 🔥 即時賽事與莊家盤口水位追蹤")
-    try:
-        df_fixtures = pd.read_sql("SELECT * FROM fixtures_v4 ORDER BY match_datetime DESC", engine)
-        if not df_fixtures.empty:
-            df_odds = pd.read_sql("SELECT * FROM odds_history_v4 ORDER BY recorded_at ASC", engine)
-            df_preds = pd.read_sql("SELECT * FROM predictions_v4", engine)
-            
-            if not df_odds.empty:
-                open_odds = df_odds.groupby('fixture_id').first().reset_index().add_prefix('open_')
-                curr_odds = df_odds.groupby('fixture_id').last().reset_index().add_prefix('curr_')
-                df = df_fixtures.merge(open_odds, left_on='fixture_id', right_on='open_fixture_id', how='left')
-                df = df.merge(curr_odds, left_on='fixture_id', right_on='curr_fixture_id', how='left')
+    tab1_sub1, tab1_sub2 = st.tabs(["🔥 最新賽事總覽", "📅 按日期查詢賽事詳細紀錄"])
+
+    # ---------------------------------------------------------
+    # 子分頁 1-1: 最新賽事總覽
+    # ---------------------------------------------------------
+    with tab1_sub1:
+        st.markdown("### 🔥 即時賽事與莊家盤口水位追蹤")
+        try:
+            df_fixtures = pd.read_sql("SELECT * FROM fixtures_v4 ORDER BY match_datetime DESC", engine)
+            if not df_fixtures.empty:
+                df_odds = pd.read_sql("SELECT * FROM odds_history_v4 ORDER BY recorded_at ASC", engine)
+                df_preds = pd.read_sql("SELECT * FROM predictions_v4", engine)
+                
+                if not df_odds.empty:
+                    open_odds = df_odds.groupby('fixture_id').first().reset_index().add_prefix('open_')
+                    curr_odds = df_odds.groupby('fixture_id').last().reset_index().add_prefix('curr_')
+                    df = df_fixtures.merge(open_odds, left_on='fixture_id', right_on='open_fixture_id', how='left')
+                    df = df.merge(curr_odds, left_on='fixture_id', right_on='curr_fixture_id', how='left')
+                else:
+                    df = df_fixtures
+                    
+                if not df_preds.empty:
+                    df = df.merge(df_preds, on='fixture_id', how='left')
+                    
+                for _, row in df.head(50).iterrows():
+                    with st.container():
+                        c1, c2, c3, c4 = st.columns([2.5, 2, 3.5, 3.5])
+                        with c1:
+                            dt_str = str(row['match_datetime'])[:16]
+                            st.markdown(f"**{row['home_team']}** vs **{row['away_team']}**")
+                            st.caption(f"📅 {dt_str} | 🏆 {row.get('league_name', '聯賽')}")
+                        with c2:
+                            hs = int(row['home_score']) if pd.notna(row.get('home_score')) else '-'
+                            aws = int(row['away_score']) if pd.notna(row.get('away_score')) else '-'
+                            hc = int(row['home_corner']) if pd.notna(row.get('home_corner')) else '-'
+                            ac = int(row['away_corner']) if pd.notna(row.get('away_corner')) else '-'
+                            st.markdown(f"""
+                                <div class="score-box">
+                                    🎯 入球: <b>{hs} - {aws}</b><br>
+                                    🚩 角球: <b>{hc} - {ac}</b>
+                                </div>
+                            """, unsafe_allow_html=True)
+                        with c3:
+                            line = format_asian_handicap(row.get('curr_ah_line', 0))
+                            open_odd = row.get('open_ah_home_odd', 0)
+                            curr_odd = row.get('curr_ah_home_odd', 0)
+                            trend_html = render_trend(open_odd, curr_odd)
+                            pick = str(row.get('recommended_pick', '觀望'))
+                            st.markdown("**勝負盤 (讓球)**")
+                            st.markdown(f"<div class='odds-display'>盤口: <b>[{line}]</b> | 主水: {trend_html}</div>", unsafe_allow_html=True)
+                            st.markdown(get_tag_html(pick), unsafe_allow_html=True)
+                        with c4:
+                            ou_line = format_ou_line(row.get('curr_ou_line', 2.5))
+                            open_ou = row.get('open_ou_over_odd', 0)
+                            curr_ou = row.get('curr_ou_over_odd', 0)
+                            trend_ou_html = render_trend(open_ou, curr_ou)
+                            ou_pick = str(row.get('ou_pick', '觀望'))
+                            st.markdown("**入球大細**")
+                            st.markdown(f"<div class='odds-display'>盤口: <b>[{ou_line}]</b> | 大水: {trend_ou_html}</div>", unsafe_allow_html=True)
+                            st.markdown(get_tag_html(ou_pick), unsafe_allow_html=True)
+                    st.divider()
             else:
-                df = df_fixtures
+                st.info("尚無賽事數據。請前往「即時 API 數據中心」進行同步。")
+        except Exception as e:
+            st.error(f"讀取數據發生錯誤：{e}")
+
+    # ---------------------------------------------------------
+    # 子分頁 1-2: 按日期選擇器查詢賽事完整記錄
+    # ---------------------------------------------------------
+    with tab1_sub2:
+        st.markdown("### 📅 按日期篩選與瀏覽賽事所有詳細紀錄")
+        
+        selected_date = st.date_input("📅 請選擇欲查詢的比賽日期：", value=datetime.now(), key="date_picker_main")
+        target_date_str = selected_date.strftime("%Y-%m-%d")
+
+        # 1. 從歷史圖文庫 historical_match_stats 撈取數據
+        hist_matches = []
+        try:
+            df_hist_all = pd.read_sql("SELECT * FROM historical_match_stats ORDER BY id DESC", engine)
+            for _, r in df_hist_all.iterrows():
+                try:
+                    dj = json.loads(r['data_json']) if r.get('data_json') and pd.notna(r['data_json']) else {}
+                except Exception:
+                    dj = {}
                 
-            if not df_preds.empty:
-                df = df.merge(df_preds, on='fixture_id', how='left')
+                m_dt = dj.get('datetime', r.get('created_at', ''))
+                norm_dt = normalize_to_yyyy_mm_dd(m_dt, r.get('created_at'))
                 
-            for _, row in df.head(50).iterrows():
-                with st.container():
-                    c1, c2, c3, c4 = st.columns([2.5, 2, 3.5, 3.5])
-                    with c1:
-                        dt_str = str(row['match_datetime'])[:16]
-                        st.markdown(f"**{row['home_team']}** vs **{row['away_team']}**")
-                        st.caption(f"📅 {dt_str} | 🏆 {row.get('league_name', '聯賽')}")
-                    with c2:
-                        hs = int(row['home_score']) if pd.notna(row.get('home_score')) else '-'
-                        aws = int(row['away_score']) if pd.notna(row.get('away_score')) else '-'
-                        hc = int(row['home_corner']) if pd.notna(row.get('home_corner')) else '-'
-                        ac = int(row['away_corner']) if pd.notna(row.get('away_corner')) else '-'
-                        st.markdown(f"""
-                            <div class="score-box">
-                                🎯 入球: <b>{hs} - {aws}</b><br>
-                                🚩 角球: <b>{hc} - {ac}</b>
-                            </div>
-                        """, unsafe_allow_html=True)
-                    with c3:
-                        line = format_asian_handicap(row.get('curr_ah_line', 0))
-                        open_odd = row.get('open_ah_home_odd', 0)
-                        curr_odd = row.get('curr_ah_home_odd', 0)
-                        trend_html = render_trend(open_odd, curr_odd)
-                        pick = str(row.get('recommended_pick', '觀望'))
-                        st.markdown("**勝負盤 (讓球)**")
-                        st.markdown(f"<div class='odds-display'>盤口: <b>[{line}]</b> | 主水: {trend_html}</div>", unsafe_allow_html=True)
-                        st.markdown(get_tag_html(pick), unsafe_allow_html=True)
-                    with c4:
-                        ou_line = format_ou_line(row.get('curr_ou_line', 2.5))
-                        open_ou = row.get('open_ou_over_odd', 0)
-                        curr_ou = row.get('curr_ou_over_odd', 0)
-                        trend_ou_html = render_trend(open_ou, curr_ou)
-                        ou_pick = str(row.get('ou_pick', '觀望'))
-                        st.markdown("**入球大細**")
-                        st.markdown(f"<div class='odds-display'>盤口: <b>[{ou_line}]</b> | 大水: {trend_ou_html}</div>", unsafe_allow_html=True)
-                        st.markdown(get_tag_html(ou_pick), unsafe_allow_html=True)
-                st.divider()
+                if norm_dt == target_date_str:
+                    label = f"📸 [歷史圖文紀錄] [{dj.get('league', '未知聯賽')}] {r['home_team']} {r['home_score']} - {r['away_score']} {r['away_team']} (時間: {m_dt})"
+                    hist_matches.append({
+                        'type': 'hist',
+                        'id': r['id'],
+                        'label': label,
+                        'data': dj,
+                        'row': r
+                    })
+        except Exception as e:
+            st.error(f"讀取歷史數據發生錯誤: {e}")
+
+        # 2. 從即時 API 賽事庫 fixtures_v4 撈取數據
+        fix_matches = []
+        try:
+            df_fix_all = pd.read_sql("SELECT * FROM fixtures_v4 ORDER BY match_datetime DESC", engine)
+            for _, r in df_fix_all.iterrows():
+                m_dt = str(r['match_datetime'])
+                norm_dt = normalize_to_yyyy_mm_dd(m_dt)
+                
+                if norm_dt == target_date_str:
+                    hs = int(r['home_score']) if pd.notna(r.get('home_score')) else '?'
+                    aws = int(r['away_score']) if pd.notna(r.get('away_score')) else '?'
+                    label = f"⚽ [API 賽事庫] [{r.get('league_name', '聯賽')}] {r['home_team']} {hs} - {aws} {r['away_team']} (時間: {m_dt})"
+                    fix_matches.append({
+                        'type': 'fix',
+                        'id': r['fixture_id'],
+                        'label': label,
+                        'row': r
+                    })
+        except Exception as e:
+            st.error(f"讀取 API 賽事發生錯誤: {e}")
+
+        all_date_matches = hist_matches + fix_matches
+
+        if not all_date_matches:
+            st.warning(f"📆 於 `{target_date_str}` 無任何賽事記錄。請試選其他日期，或前往 API / 圖片識別區新增資料。")
         else:
-            st.info("尚無賽事數據。請前往「即時 API 數據中心」進行同步。")
-    except Exception as e:
-        st.error(f"讀取數據發生錯誤：{e}")
+            st.success(f"🔍 於 `{target_date_str}` 共檢索到 `{len(all_date_matches)}` 場賽事記錄：")
+            
+            # 讓使用者從選單選取某場賽事
+            selected_match_label = st.selectbox(
+                "⚽ 請選擇要瀏覽詳細紀錄的賽事：",
+                options=[m['label'] for m in all_date_matches],
+                key="select_match_by_date"
+            )
+
+            chosen_match = next((m for m in all_date_matches if m['label'] == selected_match_label), None)
+
+            if chosen_match:
+                st.divider()
+                st.markdown("### 📊 賽事完整詳細記錄面板")
+
+                # --- 瀏覽歷史圖文記錄詳情 ---
+                if chosen_match['type'] == 'hist':
+                    dj = chosen_match['data']
+                    r = chosen_match['row']
+                    
+                    st.markdown(f"#### 🏆 {dj.get('league', '歷史賽事')} | 📅 {dj.get('datetime', r.get('created_at'))}")
+                    
+                    st.markdown(f"""
+                        <div style="background-color: #0F172A; color: white; padding: 16px; border-radius: 10px; text-align: center; margin-bottom: 15px;">
+                            <h2 style="color: white; margin:0;">{dj.get('home_team', r['home_team'])} <span style="color:#F59E0B;">{dj.get('home_score', r['home_score'])} - {dj.get('away_score', r['away_score'])}</span> {dj.get('away_team', r['away_team'])}</h2>
+                            <p style="margin:5px 0 0 0; color: #94A3B8;">半場比分: <b>{dj.get('ht_score', '-')}</b> | 狀態: 已完賽存檔</p>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                    c_m1, c_m2, c_m3 = st.columns(3)
+                    c_m1.metric("🚩 角球 (主 - 客)", f"{dj.get('home_corner', 0)} - {dj.get('away_corner', 0)}")
+                    c_m2.metric("🟨 黃牌 (主 - 客)", f"{dj.get('home_yellow', 0)} - {dj.get('away_yellow', 0)}")
+                    c_m3.metric("🟥 紅牌 (主 - 客)", f"{dj.get('home_red', 0)} - {dj.get('away_red', 0)}")
+
+                    stats = dj.get('stats', {})
+                    if stats:
+                        st.markdown("##### 📈 比賽詳細技術統計")
+                        s_col1, s_col2 = st.columns(2)
+                        
+                        poss = stats.get('possession', [0, 0])
+                        attacks = stats.get('attacks', [0, 0])
+                        d_attacks = stats.get('dangerous_attacks', [0, 0])
+                        shots_on = stats.get('shots_on_target', [0, 0])
+                        shots_off = stats.get('shots_off_target', [0, 0])
+
+                        with s_col1:
+                            st.write(f"**控球率:** {poss[0]}% - {poss[1]}%")
+                            p_val = float(poss[0])/100 if isinstance(poss, list) and len(poss)>0 and isinstance(poss[0], (int,float)) and poss[0]<=100 else 0.5
+                            st.progress(p_val)
+                            st.write(f"**進攻次數:** {attacks[0]} - {attacks[1] if len(attacks)>1 else 0}")
+                            st.write(f"**危險進攻:** {d_attacks[0]} - {d_attacks[1] if len(d_attacks)>1 else 0}")
+                        
+                        with s_col2:
+                            st.write(f"**射正次數:** {shots_on[0]} - {shots_on[1] if len(shots_on)>1 else 0}")
+                            st.write(f"**射偏次數:** {shots_off[0]} - {shots_off[1] if len(shots_off)>1 else 0}")
+
+                    odds_h = dj.get('odds_history', {})
+                    if odds_h:
+                        st.markdown("##### 💰 盤口與水位歷史異動軌跡")
+                        t_ah, t_ou, t_cn = st.tabs(["讓球盤 (AH)", "大小球 (O/U)", "角球盤 (Corners)"])
+                        
+                        with t_ah:
+                            ah_list = odds_h.get('ah', [])
+                            if ah_list:
+                                st.dataframe(pd.DataFrame(ah_list), use_container_width=True)
+                            else:
+                                st.info("無讓球盤歷史水位資料")
+
+                        with t_ou:
+                            ou_list = odds_h.get('ou', [])
+                            if ou_list:
+                                st.dataframe(pd.DataFrame(ou_list), use_container_width=True)
+                            else:
+                                st.info("無大小球歷史水位資料")
+
+                        with t_cn:
+                            cn_list = odds_h.get('corners', [])
+                            if cn_list:
+                                st.dataframe(pd.DataFrame(cn_list), use_container_width=True)
+                            else:
+                                st.info("無角球盤歷史水位資料")
+
+                    recent = dj.get('recent_form', {})
+                    if recent:
+                        st.markdown("##### 📜 兩隊近況戰績摘要")
+                        r_col1, r_col2 = st.columns(2)
+                        with r_col1:
+                            st.caption(f"**{dj.get('home_team', '主隊')} 近況:**")
+                            for item in recent.get('home_recent', []):
+                                st.text(f"• {item}")
+                        with r_col2:
+                            st.caption(f"**{dj.get('away_team', '客隊')} 近況:**")
+                            for item in recent.get('away_recent', []):
+                                st.text(f"• {item}")
+
+                    with st.expander("🔍 檢視該場賽事完整的原始 JSON 資料結構"):
+                        st.json(dj)
+
+                # --- 瀏覽 API 賽事詳情 ---
+                elif chosen_match['type'] == 'fix':
+                    r = chosen_match['row']
+                    fid = r['fixture_id']
+                    
+                    st.markdown(f"#### 🏆 {r.get('league_name', '英超')} | 📅 {r['match_datetime']}")
+                    
+                    hs = int(r['home_score']) if pd.notna(r.get('home_score')) else '-'
+                    aws = int(r['away_score']) if pd.notna(r.get('away_score')) else '-'
+                    hc = int(r['home_corner']) if pd.notna(r.get('home_corner')) else '-'
+                    ac = int(r['away_corner']) if pd.notna(r.get('away_corner')) else '-'
+
+                    st.markdown(f"""
+                        <div style="background-color: #1E293B; color: white; padding: 16px; border-radius: 10px; text-align: center; margin-bottom: 15px;">
+                            <h2 style="color: white; margin:0;">{r['home_team']} <span style="color:#38BDF8;">{hs} - {aws}</span> {r['away_team']}</h2>
+                            <p style="margin:5px 0 0 0; color: #94A3B8;">賽事狀態: <b>{r.get('status', 'NS')}</b> | 🚩 角球: <b>{hc} - {ac}</b></p>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                    f_odds = pd.read_sql(f"SELECT * FROM odds_history_v4 WHERE fixture_id = {fid} ORDER BY recorded_at ASC", engine)
+                    f_pred = pd.read_sql(f"SELECT * FROM predictions_v4 WHERE fixture_id = {fid}", engine)
+
+                    if not f_pred.empty:
+                        pred_row = f_pred.iloc[0]
+                        st.markdown("##### 🧠 資金流 AI 模型預測紀錄")
+                        p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+                        p_col1.metric("主勝計算機率", f"{int(pred_row.get('prob_home_win', 0)*100)}%")
+                        p_col2.metric("推薦讓球勝負", pred_row.get('recommended_pick', '-'))
+                        p_col3.metric("推薦入球大小", pred_row.get('ou_pick', '-'))
+                        p_col4.metric("推薦角球大小", pred_row.get('corner_pick', '-'))
+
+                    if not f_odds.empty:
+                        st.markdown("##### 📈 賠率與水位歷史紀錄數據表")
+                        st.dataframe(f_odds, use_container_width=True)
+                    else:
+                        st.info("尚無該賽事的詳細歷史賠率變化紀錄。")
 
 # ==========================================
 # 分頁 2: 資金流預測模型
