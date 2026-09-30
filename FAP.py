@@ -106,6 +106,17 @@ def init_db():
                 created_at TEXT
             )
         """))
+        # 新增垃圾桶 / 刪除備份資料庫（用於安全復原 Undo）
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS undo_trash_v4 (
+                trash_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_table TEXT,
+                original_id TEXT,
+                payload_json TEXT,
+                deleted_at TEXT,
+                batch_id TEXT
+            )
+        """))
 
 try:
     init_db()
@@ -142,9 +153,8 @@ def get_candidate_gemini_models():
     except Exception:
         return preferred_models
 
-# --- 4. 數據合併與正規化邏輯 (新增/覆蓋合併機制) ---
+# --- 4. 數據合併、刪除與復原（Undo）邏輯 ---
 def is_valid_val(v):
-    """判斷數據是否為有效值（非空、非零預設值）"""
     if v is None:
         return False
     if isinstance(v, (int, float)) and v == 0:
@@ -158,7 +168,6 @@ def is_valid_val(v):
     return True
 
 def merge_match_json(old_data, new_data):
-    """將 Gemini 新解析的 JSON 與數據庫舊 JSON 進行智慧合併（補缺與覆蓋舊值）"""
     if not old_data:
         return new_data
     if not new_data:
@@ -168,29 +177,91 @@ def merge_match_json(old_data, new_data):
 
     for k, new_v in new_data.items():
         old_v = merged.get(k)
-
-        # 若是字典（如 stats, odds_history, recent_form），進行深層合併
         if isinstance(new_v, dict) and isinstance(old_v, dict):
             merged_dict = dict(old_v)
             for sub_k, sub_v in new_v.items():
                 if is_valid_val(sub_v):
                     merged_dict[sub_k] = sub_v
             merged[k] = merged_dict
-
-        # 若是陣列 (如 recent_form 列表)
         elif isinstance(new_v, list):
             if is_valid_val(new_v):
                 merged[k] = new_v
-
-        # 一般欄位：若新資料有效，則進行更新或覆蓋
         else:
             if is_valid_val(new_v):
                 merged[k] = new_v
 
     return merged
 
+def delete_records_with_undo(table_name, id_column, target_ids):
+    """將欲刪除之資料寫入垃圾桶，隨後從原表抹除，回傳批次識別碼以供 Undo"""
+    if not target_ids:
+        return 0, None
+
+    batch_id = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{random.randint(1000,9999)}"
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    str_ids = [str(x) for x in target_ids]
+    in_clause = ",".join([f"'{x}'" for x in str_ids])
+
+    with engine.begin() as conn:
+        df_to_delete = pd.read_sql(f"SELECT * FROM {table_name} WHERE {id_column} IN ({in_clause})", conn)
+        
+        if df_to_delete.empty:
+            return 0, None
+
+        trash_records = []
+        for _, row in df_to_delete.iterrows():
+            payload = row.to_dict()
+            trash_records.append({
+                'source_table': table_name,
+                'original_id': str(row[id_column]),
+                'payload_json': json.dumps(payload, ensure_ascii=False, default=str),
+                'deleted_at': now_str,
+                'batch_id': batch_id
+            })
+
+        df_trash = pd.DataFrame(trash_records)
+        df_trash.to_sql('undo_trash_v4', conn, if_exists='append', index=False)
+
+        conn.execute(text(f"DELETE FROM {table_name} WHERE {id_column} IN ({in_clause})"))
+        
+        # 若是刪除 fixtures_v4，同步清除賠率與預測
+        if table_name == 'fixtures_v4':
+            conn.execute(text(f"DELETE FROM odds_history_v4 WHERE fixture_id IN ({in_clause})"))
+            conn.execute(text(f"DELETE FROM predictions_v4 WHERE fixture_id IN ({in_clause})"))
+
+    return len(trash_records), batch_id
+
+def restore_last_deletion(batch_id=None):
+    """復原指定批次或最後一筆刪除紀錄"""
+    with engine.begin() as conn:
+        if batch_id:
+            df_trash = pd.read_sql(text("SELECT * FROM undo_trash_v4 WHERE batch_id = :b"), conn, params={"b": batch_id})
+        else:
+            df_last_batch = pd.read_sql("SELECT batch_id FROM undo_trash_v4 ORDER BY trash_id DESC LIMIT 1", conn)
+            if df_last_batch.empty:
+                return False, "垃圾桶中無可復原之數據。"
+            last_b = df_last_batch.iloc[0]['batch_id']
+            df_trash = pd.read_sql(text("SELECT * FROM undo_trash_v4 WHERE batch_id = :b"), conn, params={"b": last_b})
+
+        if df_trash.empty:
+            return False, "未找到相符的恢復數據。"
+
+        restored_count = 0
+        for _, row in df_trash.iterrows():
+            table_name = row['source_table']
+            payload = json.loads(row['payload_json'])
+            
+            df_restore = pd.DataFrame([payload])
+            df_restore.to_sql(table_name, conn, if_exists='append', index=False)
+            restored_count += 1
+
+        b_to_del = df_trash.iloc[0]['batch_id']
+        conn.execute(text("DELETE FROM undo_trash_v4 WHERE batch_id = :b"), {"b": b_to_del})
+
+    return True, f"✅ 成功復原 {restored_count} 筆賽事數據！"
+
 def normalize_to_yyyy_mm_dd(dt_str, fallback_dt=None):
-    """將格式不同的日期統一為 YYYY-MM-DD"""
     if not dt_str or not isinstance(dt_str, str):
         if fallback_dt and isinstance(fallback_dt, str):
             return normalize_to_yyyy_mm_dd(fallback_dt)
@@ -300,6 +371,7 @@ st.markdown("""
     .wait-tag { background-color: #F3F4F6; color: #4B5563; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: bold; font-size: 0.85em; }
     .score-box { background-color: #F8FAFC; padding: 8px; border-radius: 6px; border: 1px solid #E2E8F0; text-align: center; margin-top: 5px; }
     .odds-display { font-size: 0.85em; color: #374151; background: #F1F5F9; padding: 6px; border-radius: 4px; margin-top: 5px;}
+    .trash-card { background-color: #FEF2F2; border: 1px solid #FCA5A5; padding: 10px; border-radius: 6px; margin-bottom: 8px;}
     </style>
 """, unsafe_allow_html=True)
 
@@ -308,7 +380,13 @@ st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 
 if db_connection_warning:
     st.warning(db_connection_warning)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🔥 賽事與盤口追蹤", 
+    "🧠 資金流預測模型", 
+    "🗄 即時 API 數據中心", 
+    "📸 賽事圖片智能識別與重構",
+    "🛠️ 數據庫整理、刪除與復原"
+])
 
 def get_tag_html(pick):
     if pick != '觀望':
@@ -481,7 +559,7 @@ with tab3:
                     st.error(f"API 同步失敗: {e}")
 
 # ==========================================
-# 分頁 4: 📸 賽事圖片智能識別與歷史數據庫 (支援：新增賽事 / 選擇已有賽事覆蓋與增補)
+# 分頁 4: 📸 賽事圖片智能識別與重構
 # ==========================================
 with tab4:
     st.markdown("### 📸 歷史賽事圖片數據抓取與數據庫")
@@ -491,7 +569,6 @@ with tab4:
     elif not GEMINI_API_KEY:
         st.warning("⚠ 未設定 `GEMINI_API_KEY`，請至 Streamlit Secrets 填寫。")
     else:
-        # --- 操作模式選擇 (新增賽事 vs 補充已有賽事) ---
         op_mode = st.radio(
             "📌 請選擇操作模式：",
             ["➕ 新增全新賽事紀錄", "🔄 更新 / 補充已有賽事紀錄"],
@@ -501,7 +578,6 @@ with tab4:
         selected_existing_id = None
         existing_record_json = None
 
-        # 讀取目前數據庫中的所有紀錄以供選取
         try:
             df_existing = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, data_json, created_at FROM historical_match_stats ORDER BY id DESC", engine)
         except Exception:
@@ -593,173 +669,230 @@ with tab4:
                 
                 parsed_data = None
                 last_error = None
-                
-                # 模型輪詢與自動降級備援機制
+
                 for model_name in candidate_models:
                     try:
                         with st.spinner(f"🧠 嘗試使用 Gemini 模型 ({model_name}) 進行跨圖解析..."):
                             model = genai.GenerativeModel(model_name)
                             response = model.generate_content([prompt] + images)
-                            raw_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-                            
+                            raw_text = response.text.strip().replace('```json', '').replace('```', '')
                             json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
                             if json_match:
-                                raw_text = json_match.group(0)
-                            
-                            parsed_data = json.loads(raw_text)
-                            st.success(f"✅ 成功透過 Gemini 模型 ({model_name}) 完成解析！")
-                            break
-                    except Exception as e:
-                        last_error = e
+                                parsed_data = json.loads(json_match.group(0))
+                                st.success(f"✅ Gemini 模型 ({model_name}) 解析成功！")
+                                break
+                    except Exception as ex:
+                        last_error = ex
                         continue
-                
-                if not parsed_data:
-                    st.error(f"❌ 所有 Gemini 模型解析失敗或回應非有效 JSON。最後錯誤: {last_error}")
-                else:
-                    # 處理合併邏輯 (若選取更新已有賽事)
+
+                if parsed_data:
+                    final_json = parsed_data
                     if op_mode == "🔄 更新 / 補充已有賽事紀錄" and existing_record_json:
                         final_json = merge_match_json(existing_record_json, parsed_data)
-                    else:
-                        final_json = parsed_data
 
-                    # 格式化日期時間
-                    dt_str = final_json.get("datetime", "")
-                    norm_date = normalize_to_yyyy_mm_dd(dt_str)
-                    final_json["datetime"] = dt_str if dt_str else norm_date
-
-                    home_team = final_json.get("home_team", "未知主隊")
-                    away_team = final_json.get("away_team", "未知客隊")
-                    home_score = final_json.get("home_score", 0)
-                    away_score = final_json.get("away_score", 0)
-
-                    try:
-                        home_score = int(home_score)
-                    except Exception:
-                        home_score = 0
-                    try:
-                        away_score = int(away_score)
-                    except Exception:
-                        away_score = 0
-
-                    data_json_str = json.dumps(final_json, ensure_ascii=False)
-                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    home_t = final_json.get('home_team', '未知主隊')
+                    away_t = final_json.get('away_team', '未知客隊')
+                    h_score = final_json.get('home_score', 0)
+                    a_score = final_json.get('away_score', 0)
 
                     with engine.begin() as conn:
                         if op_mode == "🔄 更新 / 補充已有賽事紀錄" and selected_existing_id:
-                            conn.execute(text("""
-                                UPDATE historical_match_stats
-                                SET home_team = :home_team,
-                                    away_team = :away_team,
-                                    home_score = :home_score,
-                                    away_score = :away_score,
-                                    data_json = :data_json
-                                WHERE id = :id
-                            """), {
-                                "home_team": home_team,
-                                "away_team": away_team,
-                                "home_score": home_score,
-                                "away_score": away_score,
-                                "data_json": data_json_str,
-                                "id": selected_existing_id
-                            })
-                            st.success(f"🎉 已成功更新賽事紀錄 (ID: {selected_existing_id})！")
+                            conn.execute(
+                                text("""
+                                    UPDATE historical_match_stats 
+                                    SET home_team = :h, away_team = :a, home_score = :hs, away_score = :as, data_json = :dj, created_at = :ca
+                                    WHERE id = :id
+                                """),
+                                {
+                                    'h': home_t, 'a': away_t, 'hs': h_score, 'as': a_score,
+                                    'dj': json.dumps(final_json, ensure_ascii=False),
+                                    'ca': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    'id': selected_existing_id
+                                }
+                            )
+                            st.success(f"🎉 賽事 ID {selected_existing_id} ({home_t} vs {away_t}) 數據補充更新成功！")
                         else:
-                            conn.execute(text("""
-                                INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
-                                VALUES (:home_team, :away_team, :home_score, :away_score, :data_json, :created_at)
-                            """), {
-                                "home_team": home_team,
-                                "away_team": away_team,
-                                "home_score": home_score,
-                                "away_score": away_score,
-                                "data_json": data_json_str,
-                                "created_at": created_at
-                            })
-                            st.success("🎉 已成功存入全新賽事紀錄！")
+                            conn.execute(
+                                text("""
+                                    INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
+                                    VALUES (:h, :a, :hs, :as, :dj, :ca)
+                                """),
+                                {
+                                    'h': home_t, 'a': away_t, 'hs': h_score, 'as': a_score,
+                                    'dj': json.dumps(final_json, ensure_ascii=False),
+                                    'ca': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                }
+                            )
+                            st.success(f"🎉 新增歷史賽事紀錄成功：{home_t} {h_score} - {a_score} {away_t}")
 
-                    st.rerun()
+                    st.json(final_json)
+                else:
+                    st.error(f"❌ 圖片解析失敗，所有 Gemini 模型均回應失敗: {last_error}")
 
-        # 顯示歷史紀錄列表與詳細資料展現
-        st.divider()
-        st.markdown("### 📊 歷史賽事統計數據庫內容")
-        try:
-            df_history = pd.read_sql("SELECT * FROM historical_match_stats ORDER BY id DESC", engine)
-            if df_history.empty:
-                st.info("尚無歷史賽事數據庫紀錄。")
+# ==========================================
+# 分頁 5: 🛠️ 數據庫整理、單一/多選/批量刪除與復原（Undo）
+# ==========================================
+with tab5:
+    st.markdown("### 🛠️ 數據庫錯誤/重複資料清理與安全復原 (Undo)")
+    st.info("💡 任何刪除操作皆會自動備份至系統垃圾桶。若誤刪可隨時點擊「復原 Undo」一鍵還原資料。")
+
+    col_u1, col_u2 = st.columns([3, 1])
+    with col_u1:
+        st.subheader("↩️ 安全復原中心 (Undo)")
+    with col_u2:
+        if st.button("↩️ 復原上一次刪除 (Undo)", type="primary", use_container_width=True):
+            ok, msg = restore_last_deletion()
+            if ok:
+                st.success(msg)
+                st.rerun()
             else:
-                for _, row in df_history.iterrows():
-                    rec_id = row['id']
-                    h_team = row['home_team']
-                    a_team = row['away_team']
-                    h_sc = row['home_score']
-                    a_sc = row['away_score']
+                st.warning(msg)
+
+    # 檢視垃圾桶歷史
+    with st.expander("🗑️ 查看垃圾桶歷史數據"):
+        try:
+            df_trash_summary = pd.read_sql("""
+                SELECT batch_id, source_table, COUNT(*) as deleted_count, MAX(deleted_at) as deleted_time 
+                FROM undo_trash_v4 
+                GROUP BY batch_id, source_table 
+                ORDER BY deleted_time DESC
+            """, engine)
+            if df_trash_summary.empty:
+                st.write("垃圾桶目前是空的。")
+            else:
+                st.dataframe(df_trash_summary, use_container_width=True)
+                selected_restore_batch = st.selectbox(
+                    "選擇要復原的特定刪除批次：", 
+                    options=df_trash_summary['batch_id'].tolist()
+                )
+                if st.button("還原選取批次"):
+                    ok, msg = restore_last_deletion(selected_restore_batch)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        except Exception as e:
+            st.info("垃圾桶尚無歷史紀錄。")
+
+    st.divider()
+
+    sub_tab1, sub_tab2 = st.tabs(["📸 歷史賽事圖片庫 (`historical_match_stats`)", "⚽ 即時 API 賽事庫 (`fixtures_v4`)"])
+
+    # ---------------------------------------------------------
+    # 子頁 1: historical_match_stats 管理
+    # ---------------------------------------------------------
+    with sub_tab1:
+        st.markdown("#### 📸 歷史圖文賽事數據整理")
+        try:
+            df_hist = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, created_at, data_json FROM historical_match_stats ORDER BY id DESC", engine)
+            if df_hist.empty:
+                st.info("目前歷史賽事庫無資料。")
+            else:
+                # 判斷潛在重複項
+                df_hist['dup_key'] = df_hist['home_team'].astype(str) + "_" + df_hist['away_team'].astype(str) + "_" + df_hist['home_score'].astype(str) + "_" + df_hist['away_score'].astype(str)
+                duplicate_keys = df_hist[df_hist.duplicated('dup_key', keep=False)]['dup_key'].unique()
+                
+                # 自動整理重複項目
+                dup_ids_to_clean = []
+                if len(duplicate_keys) > 0:
+                    st.warning(f"⚠️ 系統自動偵測到有 `{len(duplicate_keys)}` 組潛在重複的賽事紀錄！")
+                    for k in duplicate_keys:
+                        sub_df = df_hist[df_hist['dup_key'] == k]
+                        # 留最新 ID，其餘列入可清理清單
+                        ids_sorted = sub_df.sort_values('id', ascending=False)['id'].tolist()
+                        dup_ids_to_clean.extend(ids_sorted[1:])
                     
-                    try:
-                        match_info = json.loads(row['data_json']) if row.get('data_json') else {}
-                    except Exception:
-                        match_info = {}
+                    if st.button(f"🧹 智能一鍵清理重複賽事 ({len(dup_ids_to_clean)} 筆舊重複項)", type="secondary"):
+                        count, batch_id = delete_records_with_undo('historical_match_stats', 'id', dup_ids_to_clean)
+                        st.success(f"✅ 已將 {count} 筆重複數據移至垃圾桶 (批次號: {batch_id})")
+                        st.rerun()
 
-                    m_league = match_info.get('league', '未知聯賽')
-                    m_time = match_info.get('datetime', row.get('created_at', ''))
+                st.markdown("---")
+                
+                # 選擇刪除模式
+                del_mode = st.radio("請選擇刪除操作方式：", ["選取刪除 (單選/多選)", "勾選清單批量刪除"], key="hist_del_mode", horizontal=True)
+
+                if del_mode == "選取刪除 (單選/多選)":
+                    hist_options = {r['id']: f"ID: {r['id']} | {r['home_team']} {r['home_score']} - {r['away_score']} {r['away_team']} (建立: {r['created_at']})" for _, r in df_hist.iterrows()}
                     
-                    with st.expander(f"🏆 [{m_league} | {m_time}] {h_team} {h_sc} - {a_sc} {a_team} (ID: {rec_id})"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.markdown("#### ⚽ 基本數據與半場比分")
-                            st.write(f"**聯賽:** {m_league}")
-                            st.write(f"**比賽時間:** {m_time}")
-                            st.write(f"**半場比分:** {match_info.get('ht_score', '-')}")
-                            st.write(f"**黃牌 (主/客):** {match_info.get('home_yellow', 0)} / {match_info.get('away_yellow', 0)}")
-                            st.write(f"**紅牌 (主/客):** {match_info.get('home_red', 0)} / {match_info.get('away_red', 0)}")
-                            st.write(f"**角球 (主/客):** {match_info.get('home_corner', 0)} / {match_info.get('away_corner', 0)}")
-                            
-                            stats = match_info.get('stats', {})
-                            if stats:
-                                st.markdown("#### 📈 技術統計 (主隊 vs 客隊)")
-                                st.write(f"- 控球率: {stats.get('possession', ['-', '-'])}")
-                                st.write(f"- 進攻次數: {stats.get('attacks', ['-', '-'])}")
-                                st.write(f"- 危險進攻: {stats.get('dangerous_attacks', ['-', '-'])}")
-                                st.write(f"- 射正: {stats.get('shots_on_target', ['-', '-'])}")
-                                st.write(f"- 射偏: {stats.get('shots_off_target', ['-', '-'])}")
+                    selected_ids = st.multiselect(
+                        "選擇欲刪除的歷史賽事（可多選）：",
+                        options=list(hist_options.keys()),
+                        format_func=lambda x: hist_options[x]
+                    )
 
-                        with col2:
-                            st.markdown("#### 📈 水位歷史走勢 (Odds History)")
-                            odds_hist = match_info.get('odds_history', {})
-                            
-                            if odds_hist.get('ah'):
-                                st.markdown("**讓球盤 (AH)**")
-                                df_ah = pd.DataFrame(odds_hist['ah'])
-                                st.dataframe(df_ah, use_container_width=True)
-                                
-                            if odds_hist.get('ou'):
-                                st.markdown("**大細盤 (OU)**")
-                                df_ou = pd.DataFrame(odds_hist['ou'])
-                                st.dataframe(df_ou, use_container_width=True)
-                                
-                            if odds_hist.get('corners'):
-                                st.markdown("**角球盤 (Corners)**")
-                                df_cn = pd.DataFrame(odds_hist['corners'])
-                                st.dataframe(df_cn, use_container_width=True)
+                    if selected_ids and st.button(f"🗑️ 確定刪除所選的 {len(selected_ids)} 筆賽事", type="primary"):
+                        count, batch_id = delete_records_with_undo('historical_match_stats', 'id', selected_ids)
+                        st.success(f"✅ 已成功刪除 {count} 筆賽事，資料已備份至垃圾桶！")
+                        st.rerun()
 
-                        recent = match_info.get('recent_form', {})
-                        if recent and (recent.get('home_recent') or recent.get('away_recent')):
-                            st.markdown("#### 📋 近況紀錄")
-                            rc1, rc2 = st.columns(2)
-                            with rc1:
-                                st.markdown(f"**{h_team} 近況：**")
-                                for item in recent.get('home_recent', []):
-                                    st.write(f"- {item}")
-                            with rc2:
-                                st.markdown(f"**{a_team} 近況：**")
-                                for item in recent.get('away_recent', []):
-                                    st.write(f"- {item}")
-                                    
-                        # 刪除按鈕
-                        if st.button(f"🗑️ 刪除紀錄 (ID: {rec_id})", key=f"del_{rec_id}"):
-                            with engine.begin() as conn:
-                                conn.execute(text("DELETE FROM historical_match_stats WHERE id = :id"), {"id": rec_id})
-                            st.success(f"已刪除紀錄 ID: {rec_id}")
+                else:
+                    st.markdown("💡 請在下方表格中勾選欲刪除的列：")
+                    df_hist_display = df_hist[['id', 'home_team', 'away_team', 'home_score', 'away_score', 'created_at']].copy()
+                    df_hist_display['刪除勾選'] = False
+                    
+                    edited_df = st.data_editor(
+                        df_hist_display,
+                        column_config={"刪除勾選": st.column_config.CheckboxColumn("選擇刪除", default=False)},
+                        disabled=['id', 'home_team', 'away_team', 'home_score', 'away_score', 'created_at'],
+                        hide_index=True,
+                        key="hist_editor"
+                    )
+
+                    to_delete_df = edited_df[edited_df['刪除勾選'] == True]
+                    if not to_delete_df.empty:
+                        target_del_ids = to_delete_df['id'].tolist()
+                        if st.button(f"🗑️ 批量刪除已勾選的 {len(target_del_ids)} 筆項目", type="primary"):
+                            count, batch_id = delete_records_with_undo('historical_match_stats', 'id', target_del_ids)
+                            st.success(f"✅ 成功刪除 {count} 筆賽事！")
                             st.rerun()
 
         except Exception as e:
-            st.error(f"載入歷史數據庫失敗: {e}")
+            st.error(f"讀取歷史數據發生錯誤: {e}")
+
+    # ---------------------------------------------------------
+    # 子頁 2: fixtures_v4 API 賽事管理
+    # ---------------------------------------------------------
+    with sub_tab2:
+        st.markdown("#### ⚽ API 賽事數據庫 (`fixtures_v4`) 整理")
+        try:
+            df_fix = pd.read_sql("SELECT fixture_id, league_name, home_team, away_team, match_datetime, status FROM fixtures_v4 ORDER BY match_datetime DESC", engine)
+            if df_fix.empty:
+                st.info("目前 API 賽事庫無資料。")
+            else:
+                # 偵測重複
+                df_fix['dup_key'] = df_fix['home_team'].astype(str) + "_" + df_fix['away_team'].astype(str) + "_" + df_fix['match_datetime'].astype(str)
+                dup_fix_keys = df_fix[df_fix.duplicated('dup_key', keep=False)]['dup_key'].unique()
+
+                dup_fix_ids = []
+                if len(dup_fix_keys) > 0:
+                    st.warning(f"⚠️ 偵測到 `{len(dup_fix_keys)}` 組重複的 API 賽事場次！")
+                    for k in dup_fix_keys:
+                        sub_df = df_fix[df_fix['dup_key'] == k]
+                        ids_sorted = sub_df['fixture_id'].tolist()
+                        dup_fix_ids.extend(ids_sorted[1:])
+                    
+                    if st.button(f"🧹 智能一鍵清理重複 API 賽事 ({len(dup_fix_ids)} 筆)", type="secondary"):
+                        count, batch_id = delete_records_with_undo('fixtures_v4', 'fixture_id', dup_fix_ids)
+                        st.success(f"✅ 已成功將 {count} 筆重複 API 賽事刪除並備份至垃圾桶！")
+                        st.rerun()
+
+                st.markdown("---")
+                
+                selected_fix_ids = st.multiselect(
+                    "選擇欲刪除的 API 賽事（支援單選及多選）：",
+                    options=df_fix['fixture_id'].tolist(),
+                    format_func=lambda x: f"ID: {x} | [{df_fix[df_fix['fixture_id']==x]['league_name'].values[0]}] {df_fix[df_fix['fixture_id']==x]['home_team'].values[0]} vs {df_fix[df_fix['fixture_id']==x]['away_team'].values[0]} ({df_fix[df_fix['fixture_id']==x]['match_datetime'].values[0]})"
+                )
+
+                if selected_fix_ids and st.button(f"🗑️ 確定刪除所選的 {len(selected_fix_ids)} 筆 API 賽事", type="primary"):
+                    count, batch_id = delete_records_with_undo('fixtures_v4', 'fixture_id', selected_fix_ids)
+                    st.success(f"✅ 已成功刪除 {count} 筆 API 賽事！")
+                    st.rerun()
+
+                st.markdown("##### 📊 API 賽事清單一覽")
+                st.dataframe(df_fix[['fixture_id', 'league_name', 'home_team', 'away_team', 'match_datetime', 'status']], use_container_width=True)
+
+        except Exception as e:
+            st.error(f"讀取 API 賽事發生錯誤: {e}")
