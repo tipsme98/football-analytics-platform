@@ -52,7 +52,7 @@ if DATABASE_URL:
         engine = temp_engine
         db_connection_warning = None
     except Exception as e:
-        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗（如密碼包含特殊字元，請在 Secrets 中加上單引號），已自動切換回本地 SQLite。詳細錯誤: {e}"
+        db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。詳細錯誤: {e}"
         engine = sqlite_engine
 
 # --- 3. 自動初始化資料庫表架構 ---
@@ -115,8 +115,8 @@ if HAS_GENAI and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 def get_best_gemini_model():
-    # ⚠️ 修正卡死問題：移除 genai.list_models() 的動態網路請求，強制指定目前最穩定的官方模型
-    return 'models/gemini-1.5-flash'
+    # 修正 404 問題：使用標準模型識別字串
+    return 'gemini-1.5-flash'
 
 # --- 4. 輔助函數 ---
 def format_asian_handicap(line):
@@ -189,17 +189,9 @@ st.markdown("""
     <style>
     .main-header { font-size: 2rem; font-weight: bold; color: #1E3A8A; text-align: center; margin-bottom: 1rem; }
     .value-bet-tag { background-color: #DCFCE7; color: #166534; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: bold; font-size: 0.85em; }
-    .wait-tag { background-color: #F3F4F6; color: #4B5563; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.85em; }
+    .wait-tag { background-color: #F3F4F6; color: #4B5563; padding: 0.15rem 0.5rem; border-radius: 4px; font-weight: bold; font-size: 0.85em; }
     .score-box { background-color: #F8FAFC; padding: 8px; border-radius: 6px; border: 1px solid #E2E8F0; text-align: center; margin-top: 5px; }
     .odds-display { font-size: 0.85em; color: #374151; background: #F1F5F9; padding: 6px; border-radius: 4px; margin-top: 5px;}
-    
-    .match-header-dark { background-color: #1a1d24; color: white; padding: 20px; border-radius: 8px; text-align: center; font-family: sans-serif; }
-    .match-title { font-size: 14px; color: #ffcc00; margin-bottom: 15px; }
-    .team-name { font-size: 22px; font-weight: bold; display: inline-block; vertical-align: middle; margin: 0 15px; }
-    .score-large { font-size: 32px; font-weight: bold; color: #ffcc00; display: inline-block; vertical-align: middle; margin: 0 15px; }
-    
-    .stats-container { background-color: #151a22; padding: 20px; border-radius: 8px; color: white; margin-top: 15px; }
-    .stats-title { font-size: 16px; font-weight: bold; margin-bottom: 15px; border-bottom: 1px solid #2d3748; padding-bottom: 8px;}
     </style>
 """, unsafe_allow_html=True)
 
@@ -372,27 +364,25 @@ with tab3:
                     st.error(f"API 同步失敗: {e}")
 
 # ==========================================
-# 分頁 4: 📸 賽事圖片智能識別與重構 (升級版 Gemini Prompt)
+# 分頁 4: 📸 賽事圖片智能識別與歷史數據庫 (表格化介面)
 # ==========================================
 with tab4:
-    st.markdown("### 📸 歷史賽事圖片數據抓取與介面重構")
+    st.markdown("### 📸 歷史賽事圖片數據抓取與數據庫")
     
     if not HAS_GENAI:
         st.error("⚠️ 缺少 AI 套件，請確認已安裝 `google-generativeai` 與 `Pillow`。")
     elif not GEMINI_API_KEY:
-        st.warning("⚠️ 未設定 `GEMINI_API_KEY`，請至 Streamlit Secrets 填寫。")
+        st.warning("⚠️️ 未設定 `GEMINI_API_KEY`，請至 Streamlit Secrets 填寫。")
     else:
-        st.info("上傳包含比分、技術統計或賠率水位變化的賽事截圖，Gemini 將精確結構化提取資料。")
+        st.info("上傳包含比分、技術統計或賠率水位變化的賽事截圖，Gemini 將精確結構化提取資料並儲存。")
         uploaded_files = st.file_uploader("上傳賽事截圖", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
-        if uploaded_files and st.button("🚀 開始 Gemini 智能識別與重構 UI", type="primary"):
+        if uploaded_files and st.button("🚀 開始 Gemini 智能識別與解析", type="primary"):
             best_model_name = get_best_gemini_model()
-            with st.spinner(f"🧠 Gemini 正在使用模型 `{best_model_name}` 結構化解析截圖..."):
+            with st.spinner(f"🧠 Gemini 正在解析截圖數據..."):
                 try:
-                    # ⚠️ 修正卡死問題：強制轉換為 RGB 模式，避免特殊編碼或透明背景的 PNG 卡死 Gemini 解析器
                     img = Image.open(uploaded_files[0]).convert('RGB')
                     
-                    # 升級版 Gemini 專家級 Prompt
                     prompt = """
                     你是一個專業足球數據與體育博彩數據分析 AI。請仔細分析這張足球比賽網頁截圖（包含聯賽名稱、隊伍、比分、黃/紅牌、角球、進攻/危險進攻/控球率等技術統計，以及讓球盤口與大細球盤口的水位變化）。
 
@@ -441,7 +431,6 @@ with tab4:
                     response = model.generate_content([prompt, img])
                     raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
                     
-                    # 擷取標準 JSON 區塊
                     start_idx = raw_text.find('{')
                     end_idx = raw_text.rfind('}')
                     if start_idx != -1 and end_idx != -1:
@@ -462,93 +451,121 @@ with tab4:
                                 "dj": json.dumps(parsed_data),
                                 "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             })
-                        st.success("✅ AI 成功識別截圖所有數據（含讓球/大細水位變化）並儲存至資料庫！")
-                        st.session_state['current_parsed_match'] = parsed_data
+                        st.success("✅ AI 成功識別截圖所有數據並已成功寫入數據庫！")
+                        st.rerun()
                     else:
-                        st.error("解析出來的資料為空。")
+                        st.error("解析資料為空，請重新上傳清晰截圖。")
                 except Exception as e:
-                    st.error(f"系統處理圖片時發生錯誤。模型: {best_model_name}。錯誤訊息: {e}")
+                    st.error(f"系統處理圖片時發生錯誤。錯誤訊息: {e}")
 
-        # 呈現解析後的資料與動態表格
-        parsed_data = st.session_state.get('current_parsed_match', None)
-        if not parsed_data:
+    st.divider()
+    st.markdown("### 📅 歷史賽事紀錄查詢")
+
+    # 讀取數據庫歷史資料
+    try:
+        df_history = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, data_json, created_at FROM historical_match_stats ORDER BY id DESC", engine)
+    except Exception as e:
+        df_history = pd.DataFrame()
+
+    if not df_history.empty:
+        # 解析並提取每一筆紀錄的日期
+        record_list = []
+        for _, row in df_history.iterrows():
             try:
-                db_record = pd.read_sql("SELECT data_json FROM historical_match_stats ORDER BY id DESC LIMIT 1", engine)
-                if not db_record.empty:
-                    parsed_data = json.loads(db_record.iloc[0]['data_json'])
-            except: pass
-
-        if parsed_data:
-            st.markdown(f"""
-            <div class="match-header-dark">
-                <div class="match-title">{parsed_data.get('league','')} • {parsed_data.get('datetime','')}</div>
-                <div>
-                    <div class="team-name">{parsed_data.get('home_team','')}</div>
-                    <div class="score-large">{parsed_data.get('home_score',0)}</div>
-                    <div style="display:inline-block; text-align:center; vertical-align:middle; margin: 0 15px;">
-                        <div style="font-size:18px; font-weight:bold; color:#ffcc00;">完</div>
-                        <div style="font-size:12px; margin-top:4px;">
-                            <span style="color:#f59e0b;">🟨 {parsed_data.get('home_yellow',0)}</span>
-                            <span style="color:#ef4444; margin-left:4px;">🟥 {parsed_data.get('home_red',0)}</span>
-                            <span style="color:#10b981; margin-left:8px;">🚩 {parsed_data.get('home_corner',0)} - {parsed_data.get('away_corner',0)}</span>
-                            <span style="color:#f59e0b; margin-left:8px;">🟨 {parsed_data.get('away_yellow',0)}</span>
-                            <span style="color:#ef4444; margin-left:4px;">🟥 {parsed_data.get('away_red',0)}</span>
-                        </div>
-                        <div style="font-size:12px; color:#ffcc00; margin-top:4px;">HT: ({parsed_data.get('ht_score','-')})</div>
-                    </div>
-                    <div class="score-large">{parsed_data.get('away_score',0)}</div>
-                    <div class="team-name">{parsed_data.get('away_team','')}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+                dj = json.loads(row['data_json'])
+            except:
+                dj = {}
             
-            sub_tab1, sub_tab2, sub_tab3 = st.tabs(["📊 技術統計", "📈 盤口與水位變化表", "📜 歷史記錄庫"])
+            match_dt = dj.get('datetime', '')
+            date_str = match_dt[:10] if len(match_dt) >= 10 else str(row['created_at'])[:10]
             
-            with sub_tab1:
-                s = parsed_data.get('stats', {})
-                att = s.get('attacks', [0, 0])
-                d_att = s.get('dangerous_attacks', [0, 0])
-                pos = s.get('possession', [50, 50])
-                shots_on = s.get('shots_on_target', [0, 0])
-                shots_off = s.get('shots_off_target', [0, 0])
-                
-                st.markdown(f"""
-                <div class="stats-container">
-                    <div class="stats-title">比賽技術數據分析</div>
-                    <div style="display:flex; justify-content:space-around; text-align:center; margin-bottom:15px;">
-                        <div><div style="color:#94a3b8; font-size:12px;">進攻</div><div style="font-size:18px;">{att[0]} vs {att[1]}</div></div>
-                        <div><div style="color:#94a3b8; font-size:12px;">危險進攻</div><div style="font-size:18px;">{d_att[0]} vs {d_att[1]}</div></div>
-                        <div><div style="color:#94a3b8; font-size:12px;">控球率</div><div style="font-size:18px;">{pos[0]}% vs {pos[1]}%</div></div>
-                    </div>
-                    <div style="display:flex; justify-content:space-around; text-align:center;">
-                        <div><div style="color:#94a3b8; font-size:12px;">射正</div><div style="font-size:18px;">{shots_on[0]} vs {shots_on[1]}</div></div>
-                        <div><div style="color:#94a3b8; font-size:12px;">射偏</div><div style="font-size:18px;">{shots_off[0]} vs {shots_off[1]}</div></div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+            record_list.append({
+                "id": row['id'],
+                "record_date": date_str,
+                "league": dj.get('league', '未知聯賽'),
+                "match_time": match_dt,
+                "home_team": dj.get('home_team', row['home_team']),
+                "away_team": dj.get('away_team', row['away_team']),
+                "score": f"{dj.get('home_score', row['home_score'])} - {dj.get('away_score', row['away_score'])}",
+                "data_json": dj
+            })
 
-            with sub_tab2:
-                st.markdown("#### 📊 莊家盤口與水位變化即時對比")
-                ot = parsed_data.get('odds_trend', {})
-                
-                df_odds_table = pd.DataFrame([
-                    {
-                        "玩法類型": "讓球盤 (AH)", 
-                        "盤口": ot.get('ah_line', '0'), 
-                        "初盤水位 (主 / 客)": f"{ot.get('home_initial_odd', '-')} / {ot.get('away_initial_odd', '-')}", 
-                        "即時/終盤水位 (主 / 客)": f"{ot.get('home_current_odd', '-')} / {ot.get('away_current_odd', '-')}"
-                    },
-                    {
-                        "玩法類型": "入球大細 (OU)", 
-                        "盤口": ot.get('ou_line', '2.5'), 
-                        "初盤水位 (大 / 細)": f"{ot.get('ou_over_initial', '-')} / {ot.get('ou_under_initial', '-')}", 
-                        "即時/終盤水位 (大 / 細)": f"{ot.get('ou_over_current', '-')} / {ot.get('ou_under_current', '-')}"
-                    }
-                ])
-                st.table(df_odds_table)
+        df_records = pd.DataFrame(record_list)
+        available_dates = sorted(list(df_records['record_date'].unique()), reverse=True)
 
-            with sub_tab3:
-                try:
-                    df_h = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, created_at FROM historical_match_stats ORDER BY id DESC", engine)
-                    st.dataframe(df_h, use_container_width=True)
-                except: pass
+        col_date, _ = st.columns([1, 2])
+        with col_date:
+            selected_date = st.selectbox("📅 請選擇查詢日期：", available_dates)
+
+        # 篩選選定日期的賽事表
+        day_matches = df_records[df_records['record_date'] == selected_date]
+
+        st.markdown(f"#### 📋 {selected_date} 已記錄賽事列表")
+        summary_table = day_matches[['match_time', 'league', 'home_team', 'score', 'away_team']].copy()
+        summary_table.columns = ['比賽時間', '聯賽名稱', '主隊', '比分', '客隊']
+        st.dataframe(summary_table, use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # 選擇單場賽事進行詳細查詢
+        match_options = {row['id']: f"[{row['league']}] {row['home_team']} vs {row['away_team']} ({row['score']})" for _, row in day_matches.iterrows()}
+        selected_match_id = st.selectbox("⚽ 請選擇要檢視詳細資料的賽事：", options=list(match_options.keys()), format_func=lambda x: match_options[x])
+
+        selected_record = day_matches[day_matches['id'] == selected_match_id].iloc[0]
+        data = selected_record['data_json']
+
+        # 詳細資料以 3 大 Tab 表格展示
+        sub1, sub2, sub3 = st.tabs(["📊 技術統計", "📈 盤口與水位變化表", "⚽ 賽果"])
+
+        with sub1:
+            st.markdown("##### 📊 團隊詳細技術統計")
+            stats = data.get('stats', {})
+            att = stats.get('attacks', [0, 0])
+            d_att = stats.get('dangerous_attacks', [0, 0])
+            pos = stats.get('possession', [0, 0])
+            shots_on = stats.get('shots_on_target', [0, 0])
+            shots_off = stats.get('shots_off_target', [0, 0])
+
+            df_stats_table = pd.DataFrame([
+                {"技術指標": "進攻次數", "主隊": att[0], "客隊": att[1]},
+                {"技術指標": "危險進攻次數", "主隊": d_att[0], "客隊": d_att[1]},
+                {"技術指標": "控球率 (%)", "主隊": f"{pos[0]}%", "客隊": f"{pos[1]}%"},
+                {"技術指標": "射正次數", "主隊": shots_on[0], "客隊": shots_on[1]},
+                {"技術指標": "射偏次數", "主隊": shots_off[0], "客隊": shots_off[1]},
+            ])
+            st.table(df_stats_table)
+
+        with sub2:
+            st.markdown("##### 📈 莊家盤口與水位變化表")
+            ot = data.get('odds_trend', {})
+            
+            df_odds_table = pd.DataFrame([
+                {
+                    "玩法類型": "讓球盤 (AH)", 
+                    "盤口": ot.get('ah_line', '0'), 
+                    "初盤水位 (主 / 客)": f"{ot.get('home_initial_odd', '-')} / {ot.get('away_initial_odd', '-')}", 
+                    "即時/終盤水位 (主 / 客)": f"{ot.get('home_current_odd', '-')} / {ot.get('away_current_odd', '-')}"
+                },
+                {
+                    "玩法類型": "入球大細 (OU)", 
+                    "盤口": ot.get('ou_line', '2.5'), 
+                    "初盤水位 (大 / 細)": f"{ot.get('ou_over_initial', '-')} / {ot.get('ou_under_initial', '-')}", 
+                    "即時/終盤水位 (大 / 細)": f"{ot.get('ou_over_current', '-')} / {ot.get('ou_under_current', '-')}"
+                }
+            ])
+            st.table(df_odds_table)
+
+        with sub3:
+            st.markdown("##### ⚽ 賽事數據與賽果總覽")
+            df_result_table = pd.DataFrame([
+                {"項目": "賽事聯賽 / 時間", "數據": f"{data.get('league', '-')} ({data.get('datetime', '-')})"},
+                {"項目": "主隊 vs 客隊", "數據": f"{data.get('home_team', '主隊')} vs {data.get('away_team', '客隊')}"},
+                {"項目": "全場最終比分", "數據": f"{data.get('home_score', 0)} - {data.get('away_score', 0)}"},
+                {"項目": "半場比分 (HT)", "數據": str(data.get('ht_score', '-'))},
+                {"項目": "黃牌數 (主隊 / 客隊)", "數據": f"🟨 {data.get('home_yellow', 0)} / 🟨 {data.get('away_yellow', 0)}"},
+                {"項目": "紅牌數 (主隊 / 客隊)", "數據": f"🟥 {data.get('home_red', 0)} / 🟥 {data.get('away_red', 0)}"},
+                {"項目": "角球數 (主隊 / 客隊)", "數據": f"🚩 {data.get('home_corner', 0)} / 🚩 {data.get('away_corner', 0)}"}
+            ])
+            st.table(df_result_table)
+    else:
+        st.info("目前數據庫尚無已記錄的歷史賽事截圖數據。")
