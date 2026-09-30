@@ -212,7 +212,7 @@ st.markdown('<p class="main-header">⚽ 專業足球精算與價值投注平台 
 if db_connection_warning:
     st.warning(db_connection_warning)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 賽事與盤口追蹤", "🧠 資金流預測模型", "🗄️️ 即時 API 數據中心", "📸 賽事圖片智能識別與重構"])
 
 def get_tag_html(pick):
     if pick != "觀望": return f'<span class="value-bet-tag">💎 投注: {pick}</span>'
@@ -382,7 +382,7 @@ with tab4:
     st.markdown("### 📸 歷史賽事圖片數據抓取與介面重構")
     
     if not HAS_GENAI:
-        st.error("⚠️ 缺少 AI 套件，請在 GitHub `requirements.txt` 中加入 `google-generativeai` 與 `Pillow`。")
+        st.error("⚠️ 缺少 AI 套件，請在 GitHub `requirements.txt` 中確認包含 `google-generativeai>=0.5.2` 與 `Pillow`。")
     elif not GEMINI_API_KEY:
         st.warning("⚠️ 未設定 `GEMINI_API_KEY`，請在 Streamlit Secrets 中填寫。")
     else:
@@ -390,7 +390,7 @@ with tab4:
         uploaded_files = st.file_uploader("上傳賽事截圖", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
         if uploaded_files and st.button("🚀 開始 Gemini 智能識別與重構 UI", type="primary"):
-            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據 (啟動多重模型備援)..."):
+            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據..."):
                 try:
                     img = Image.open(uploaded_files[0])
                     prompt = """
@@ -421,8 +421,8 @@ with tab4:
                     }
                     """
                     
-                    # 實作多重模型容錯機制
-                    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro-vision']
+                    # 實作多重模型容錯機制 (移除已被 Google 棄用的 gemini-pro-vision)
+                    models_to_try = ['gemini-1.5-flash', 'gemini-1.5-pro']
                     parsed_data = None
                     last_error = None
                     
@@ -438,7 +438,7 @@ with tab4:
                             continue
                             
                     if not parsed_data:
-                        st.error(f"圖片識別解析失敗 (已嘗試所有模型均失敗)。最後錯誤: {last_error}")
+                        st.error(f"圖片識別解析失敗。請確認您的 requirements.txt 已更新 google-generativeai 版本。最後錯誤: {last_error}")
                     else:
                         # 寫入資料庫
                         with engine.begin() as conn:
