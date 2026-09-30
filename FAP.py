@@ -600,4 +600,166 @@ with tab4:
                         with st.spinner(f"🧠 嘗試使用 Gemini 模型 ({model_name}) 進行跨圖解析..."):
                             model = genai.GenerativeModel(model_name)
                             response = model.generate_content([prompt] + images)
-                            raw_text = response.text.strip().replace('```json', '').replace('
+                            raw_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+                            
+                            json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                            if json_match:
+                                raw_text = json_match.group(0)
+                            
+                            parsed_data = json.loads(raw_text)
+                            st.success(f"✅ 成功透過 Gemini 模型 ({model_name}) 完成解析！")
+                            break
+                    except Exception as e:
+                        last_error = e
+                        continue
+                
+                if not parsed_data:
+                    st.error(f"❌ 所有 Gemini 模型解析失敗或回應非有效 JSON。最後錯誤: {last_error}")
+                else:
+                    # 處理合併邏輯 (若選取更新已有賽事)
+                    if op_mode == "🔄 更新 / 補充已有賽事紀錄" and existing_record_json:
+                        final_json = merge_match_json(existing_record_json, parsed_data)
+                    else:
+                        final_json = parsed_data
+
+                    # 格式化日期時間
+                    dt_str = final_json.get("datetime", "")
+                    norm_date = normalize_to_yyyy_mm_dd(dt_str)
+                    final_json["datetime"] = dt_str if dt_str else norm_date
+
+                    home_team = final_json.get("home_team", "未知主隊")
+                    away_team = final_json.get("away_team", "未知客隊")
+                    home_score = final_json.get("home_score", 0)
+                    away_score = final_json.get("away_score", 0)
+
+                    try:
+                        home_score = int(home_score)
+                    except Exception:
+                        home_score = 0
+                    try:
+                        away_score = int(away_score)
+                    except Exception:
+                        away_score = 0
+
+                    data_json_str = json.dumps(final_json, ensure_ascii=False)
+                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    with engine.begin() as conn:
+                        if op_mode == "🔄 更新 / 補充已有賽事紀錄" and selected_existing_id:
+                            conn.execute(text("""
+                                UPDATE historical_match_stats
+                                SET home_team = :home_team,
+                                    away_team = :away_team,
+                                    home_score = :home_score,
+                                    away_score = :away_score,
+                                    data_json = :data_json
+                                WHERE id = :id
+                            """), {
+                                "home_team": home_team,
+                                "away_team": away_team,
+                                "home_score": home_score,
+                                "away_score": away_score,
+                                "data_json": data_json_str,
+                                "id": selected_existing_id
+                            })
+                            st.success(f"🎉 已成功更新賽事紀錄 (ID: {selected_existing_id})！")
+                        else:
+                            conn.execute(text("""
+                                INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
+                                VALUES (:home_team, :away_team, :home_score, :away_score, :data_json, :created_at)
+                            """), {
+                                "home_team": home_team,
+                                "away_team": away_team,
+                                "home_score": home_score,
+                                "away_score": away_score,
+                                "data_json": data_json_str,
+                                "created_at": created_at
+                            })
+                            st.success("🎉 已成功存入全新賽事紀錄！")
+
+                    st.rerun()
+
+        # 顯示歷史紀錄列表與詳細資料展現
+        st.divider()
+        st.markdown("### 📊 歷史賽事統計數據庫內容")
+        try:
+            df_history = pd.read_sql("SELECT * FROM historical_match_stats ORDER BY id DESC", engine)
+            if df_history.empty:
+                st.info("尚無歷史賽事數據庫紀錄。")
+            else:
+                for _, row in df_history.iterrows():
+                    rec_id = row['id']
+                    h_team = row['home_team']
+                    a_team = row['away_team']
+                    h_sc = row['home_score']
+                    a_sc = row['away_score']
+                    
+                    try:
+                        match_info = json.loads(row['data_json']) if row.get('data_json') else {}
+                    except Exception:
+                        match_info = {}
+
+                    m_league = match_info.get('league', '未知聯賽')
+                    m_time = match_info.get('datetime', row.get('created_at', ''))
+                    
+                    with st.expander(f"🏆 [{m_league} | {m_time}] {h_team} {h_sc} - {a_sc} {a_team} (ID: {rec_id})"):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("#### ⚽ 基本數據與半場比分")
+                            st.write(f"**聯賽:** {m_league}")
+                            st.write(f"**比賽時間:** {m_time}")
+                            st.write(f"**半場比分:** {match_info.get('ht_score', '-')}")
+                            st.write(f"**黃牌 (主/客):** {match_info.get('home_yellow', 0)} / {match_info.get('away_yellow', 0)}")
+                            st.write(f"**紅牌 (主/客):** {match_info.get('home_red', 0)} / {match_info.get('away_red', 0)}")
+                            st.write(f"**角球 (主/客):** {match_info.get('home_corner', 0)} / {match_info.get('away_corner', 0)}")
+                            
+                            stats = match_info.get('stats', {})
+                            if stats:
+                                st.markdown("#### 📈 技術統計 (主隊 vs 客隊)")
+                                st.write(f"- 控球率: {stats.get('possession', ['-', '-'])}")
+                                st.write(f"- 進攻次數: {stats.get('attacks', ['-', '-'])}")
+                                st.write(f"- 危險進攻: {stats.get('dangerous_attacks', ['-', '-'])}")
+                                st.write(f"- 射正: {stats.get('shots_on_target', ['-', '-'])}")
+                                st.write(f"- 射偏: {stats.get('shots_off_target', ['-', '-'])}")
+
+                        with col2:
+                            st.markdown("#### 📈 水位歷史走勢 (Odds History)")
+                            odds_hist = match_info.get('odds_history', {})
+                            
+                            if odds_hist.get('ah'):
+                                st.markdown("**讓球盤 (AH)**")
+                                df_ah = pd.DataFrame(odds_hist['ah'])
+                                st.dataframe(df_ah, use_container_width=True)
+                                
+                            if odds_hist.get('ou'):
+                                st.markdown("**大細盤 (OU)**")
+                                df_ou = pd.DataFrame(odds_hist['ou'])
+                                st.dataframe(df_ou, use_container_width=True)
+                                
+                            if odds_hist.get('corners'):
+                                st.markdown("**角球盤 (Corners)**")
+                                df_cn = pd.DataFrame(odds_hist['corners'])
+                                st.dataframe(df_cn, use_container_width=True)
+
+                        recent = match_info.get('recent_form', {})
+                        if recent and (recent.get('home_recent') or recent.get('away_recent')):
+                            st.markdown("#### 📋 近況紀錄")
+                            rc1, rc2 = st.columns(2)
+                            with rc1:
+                                st.markdown(f"**{h_team} 近況：**")
+                                for item in recent.get('home_recent', []):
+                                    st.write(f"- {item}")
+                            with rc2:
+                                st.markdown(f"**{a_team} 近況：**")
+                                for item in recent.get('away_recent', []):
+                                    st.write(f"- {item}")
+                                    
+                        # 刪除按鈕
+                        if st.button(f"🗑️ 刪除紀錄 (ID: {rec_id})", key=f"del_{rec_id}"):
+                            with engine.begin() as conn:
+                                conn.execute(text("DELETE FROM historical_match_stats WHERE id = :id"), {"id": rec_id})
+                            st.success(f"已刪除紀錄 ID: {rec_id}")
+                            st.rerun()
+
+        except Exception as e:
+            st.error(f"載入歷史數據庫失敗: {e}")
