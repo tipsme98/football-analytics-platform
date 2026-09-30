@@ -56,7 +56,10 @@ if DATABASE_URL:
         engine = temp_engine
         db_connection_warning = None # 如果成功就清除警告
     except Exception as e:
-        if not db_connection_warning:
+        error_msg = str(e)
+        if "password authentication failed" in error_msg and "pooler.supabase.com" in url:
+            db_connection_warning = "⚠️ Supabase 連線失敗：使用者名稱或密碼錯誤。請確保您的使用者名稱包含專案代碼 (例如 postgres.vgtg...) 而非僅有 postgres。已自動切換回本地 SQLite。"
+        elif not db_connection_warning:
             db_connection_warning = f"⚠️ 雲端 PostgreSQL 連線失敗，已自動切換回本地 SQLite。詳細錯誤: {e}"
         engine = sqlite_engine
 
@@ -128,16 +131,16 @@ def get_best_gemini_model():
             if 'generateContent' in m.supported_generation_methods:
                 available_models.append(m.name)
         
-        # 優先選擇 flash 其次 pro
-        for pref in ['models/gemini-1.5-flash', 'models/gemini-1.5-pro', 'models/gemini-pro-vision']:
+        # 優先選擇最新的 3.8-flash 解決 404 棄用問題
+        for pref in ['models/gemini-3.8-flash', 'models/gemini-2.5-flash', 'models/gemini-1.5-flash']:
             if pref in available_models:
                 return pref
         # 若找不到預設名稱，返回列表中第一個支援生成的模型
         if available_models:
             return available_models[0]
-        return 'gemini-1.5-flash' # 硬限制的最終回退
+        return 'models/gemini-3.8-flash' # 硬限制的最終回退
     except:
-        return 'gemini-1.5-flash'
+        return 'models/gemini-3.8-flash'
 
 # --- 4. 輔助函數 ---
 def format_asian_handicap(line):
