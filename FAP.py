@@ -6,10 +6,9 @@ import sys
 import os
 import requests
 import json
-from io import StringIO
 from sqlalchemy import text, create_engine
 
-# --- 防呆機制：避免套件未安裝導致整個 App 崩潰 ---
+# --- 防呆機制：Gemini 與 Image 套件 ---
 try:
     import google.generativeai as genai
     from PIL import Image
@@ -17,34 +16,87 @@ try:
 except ImportError:
     HAS_GENAI = False
 
-# --- 資料庫連線安全配置 ---
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-if CURRENT_DIR not in sys.path:
-    sys.path.append(CURRENT_DIR)
-
-try:
-    from src.database.connection import engine
-except ImportError:
-    db_path = os.path.join(CURRENT_DIR, "football_data.db")
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={'check_same_thread': False})
-
-# ==========================================
-# 金鑰安全獲取機制 
-# ==========================================
+# --- 1. 安全獲取 Secrets / 環境變數 ---
 def get_secret(key_name):
-    if key_name in st.secrets: return st.secrets[key_name]
+    if key_name in st.secrets:
+        return st.secrets[key_name]
     return os.environ.get(key_name, "")
 
 API_FOOTBALL_KEY = get_secret("API_FOOTBALL_KEY")
 THE_ODDS_API_KEY = get_secret("THE_ODDS_API_KEY")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
+DATABASE_URL = get_secret("DATABASE_URL")
 
+# --- 2. 雲端/本地 資料庫連線配置 ---
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if DATABASE_URL:
+    # 支援 Supabase / Neon 等 PostgreSQL 雲端資料庫
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+else:
+    # 備用：本地 SQLite 資料庫
+    db_path = os.path.join(CURRENT_DIR, "football_data.db")
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={'check_same_thread': False})
+
+# --- 3. 自動初始化資料庫（解決 no such table 錯誤）---
+def init_db():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fixtures_v4 (
+                fixture_id BIGINT PRIMARY KEY,
+                league_name TEXT,
+                home_team TEXT,
+                away_team TEXT,
+                match_datetime TEXT,
+                home_score INTEGER,
+                away_score INTEGER,
+                home_corner INTEGER,
+                away_corner INTEGER,
+                status TEXT
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS odds_history_v4 (
+                fixture_id BIGINT,
+                ah_line TEXT,
+                ah_home_odd REAL,
+                ah_away_odd REAL,
+                ou_line TEXT,
+                ou_over_odd REAL,
+                ou_under_odd REAL,
+                recorded_at TEXT
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS predictions_v4 (
+                fixture_id BIGINT PRIMARY KEY,
+                prob_home_win REAL,
+                value_bet_detected BOOLEAN,
+                recommended_pick TEXT,
+                ou_pick TEXT,
+                corner_pick TEXT
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS historical_match_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                home_team TEXT,
+                away_team TEXT,
+                home_score INT,
+                away_score INT,
+                data_json TEXT,
+                created_at TEXT
+            )
+        """))
+
+init_db()
+
+# 配置 Gemini
 if HAS_GENAI and GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ==========================================
-# 核心轉換演算法：亞洲讓球盤與大細盤轉換
-# ==========================================
+# --- 4. 輔助函數 ---
 def format_asian_handicap(line):
     try:
         val = float(line)
@@ -69,9 +121,7 @@ def render_trend(open_odd, curr_odd):
     if curr_odd < open_odd: return f"<span style='color:red;'>⬇ {curr_odd}</span> <span style='font-size:0.7em;color:#999;'>(初: {open_odd})</span>"
     return f"<span style='color:green;'>⬆ {curr_odd}</span> <span style='font-size:0.7em;color:#999;'>(初: {open_odd})</span>"
 
-# ==========================================
-# 資金流盤口預測引擎 (Tipsme 邏輯)
-# ==========================================
+# --- 5. 資金流預測引擎 ---
 class SmartOddsPredictor:
     def execute_prediction(self):
         try:
@@ -89,7 +139,6 @@ class SmartOddsPredictor:
                 curr_data = f_odds.iloc[-1]
                 
                 home_odd_drop = open_data['ah_home_odd'] - curr_data['ah_home_odd']
-                
                 prob_h = 0.5 + (home_odd_drop * 0.3) 
                 is_value = abs(home_odd_drop) > 0.15 
                 
@@ -105,16 +154,13 @@ class SmartOddsPredictor:
             df_p = pd.DataFrame(preds)
             if not df_p.empty:
                 with engine.begin() as conn:
-                    conn.execute(text("CREATE TABLE IF NOT EXISTS predictions_v4 (fixture_id INTEGER PRIMARY KEY, prob_home_win REAL, value_bet_detected BOOLEAN, recommended_pick TEXT, ou_pick TEXT, corner_pick TEXT)"))
                     conn.execute(text("DELETE FROM predictions_v4"))
                     df_p.to_sql('predictions_v4', conn, if_exists='append', index=False)
             return True
         except Exception: 
             return False
 
-# ==========================================
-# 頁面配置 & CSS
-# ==========================================
+# --- 6. 介面樣式 ---
 st.set_page_config(page_title="專業足球精算平台", page_icon="⚽", layout="wide")
 
 st.markdown("""
@@ -139,7 +185,6 @@ st.markdown("""
     
     .stats-container { background-color: #151a22; padding: 20px; border-radius: 8px; color: white; margin-top: 15px; }
     .stats-title { font-size: 16px; font-weight: bold; margin-bottom: 20px; border-bottom: 1px solid #2d3748; padding-bottom: 10px;}
-    .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -160,12 +205,7 @@ with tab1:
         df_fixtures = pd.read_sql("SELECT * FROM fixtures_v4 ORDER BY match_datetime DESC", engine)
         if not df_fixtures.empty:
             df_odds = pd.read_sql("SELECT * FROM odds_history_v4 ORDER BY recorded_at ASC", engine)
-            
-            # 安全檢查 predictions_v4 是否存在
-            try:
-                df_preds = pd.read_sql("SELECT * FROM predictions_v4", engine)
-            except Exception:
-                df_preds = pd.DataFrame()
+            df_preds = pd.read_sql("SELECT * FROM predictions_v4", engine)
             
             if not df_odds.empty:
                 open_odds = df_odds.groupby('fixture_id').first().reset_index().add_prefix('open_')
@@ -218,7 +258,7 @@ with tab1:
         else:
             st.info("尚無賽事數據。請前往「即時 API 數據中心」進行同步。")
     except Exception as e:
-        st.error(f"讀取數據發生錯誤，請先同步資料庫。({e})")
+        st.error(f"讀取數據發生錯誤：{e}")
 
 # ==========================================
 # 分頁 2: 資金流預測模型
@@ -230,8 +270,8 @@ with tab2:
         with st.spinner("正在比對初盤與即時盤水位..."):
             predictor = SmartOddsPredictor()
             if predictor.execute_prediction():
-                st.success("✅ 分析完成！系統已根據『賠率暴跌/誘盤』等資金跡象更新推薦。請查看賽事總覽。")
-                st.cache_data.clear()
+                st.success("✅ 分析完成！系統已更新推薦。請查看賽事總覽。")
+                st.rerun()
             else:
                 st.error("❌ 分析失敗：未能檢測到未開賽賽事或缺乏盤口歷史數據。")
 
@@ -264,9 +304,9 @@ with tab3:
     st.divider()
     try:
         db_count = pd.read_sql("SELECT COUNT(*) as count FROM fixtures_v4", engine).iloc[0]['count']
-        st.markdown(f"📊 **目前資料庫總收錄賽事： `{db_count}` 場**")
+        st.markdown(f"📊 **目前數據庫總收錄賽事： `{db_count}` 場**")
     except:
-        st.markdown("📊 **目前資料庫總收錄賽事： `0` 場**")
+        st.markdown("📊 **目前數據庫總收錄賽事： `0` 場**")
 
     if st.button("📥 同步今日與未來賽程 (即時 API)"):
         with st.spinner("正在透過 API 獲取即時賽事與盤口..."):
@@ -278,7 +318,7 @@ with tab3:
                     if isinstance(res, list) and len(res) > 0:
                         fixtures, odds = [], []
                         for match in res:
-                            fid = hash(match['id']) % 1000000
+                            fid = abs(hash(match['id'])) % 1000000
                             dt = datetime.strptime(match['commence_time'], "%Y-%m-%dT%H:%M:%SZ") + timedelta(hours=8)
                             fixtures.append({
                                 "fixture_id": fid, "league_name": "英超",
@@ -297,173 +337,146 @@ with tab3:
                                         ou_line = market['outcomes'][0].get('point', 2.5)
                                         ou_over = market['outcomes'][0].get('price', 1.90)
                             odds.append({
-                                "fixture_id": fid, "ah_line": ah_line, "ah_home_odd": ah_home, "ah_away_odd": 1.90,
-                                "ou_line": ou_line, "ou_over_odd": ou_over, "ou_under_odd": 1.90,
+                                "fixture_id": fid, "ah_line": str(ah_line), "ah_home_odd": ah_home, "ah_away_odd": 1.90,
+                                "ou_line": str(ou_line), "ou_over_odd": ou_over, "ou_under_odd": 1.90,
                                 "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             })
                         df_f = pd.DataFrame(fixtures).drop_duplicates('fixture_id')
                         df_o = pd.DataFrame(odds)
                         with engine.begin() as conn:
-                            conn.execute(text("CREATE TABLE IF NOT EXISTS fixtures_v4 (fixture_id INTEGER PRIMARY KEY, league_name TEXT, home_team TEXT, away_team TEXT, match_datetime TEXT, home_score INTEGER, away_score INTEGER, home_corner INTEGER, away_corner INTEGER, status TEXT)"))
-                            conn.execute(text("CREATE TABLE IF NOT EXISTS odds_history_v4 (fixture_id INTEGER, ah_line TEXT, ah_home_odd REAL, ah_away_odd REAL, ou_line TEXT, ou_over_odd REAL, ou_under_odd REAL, recorded_at TEXT)"))
                             df_f.to_sql('fixtures_v4', conn, if_exists='append', index=False)
                             df_o.to_sql('odds_history_v4', conn, if_exists='append', index=False)
                         st.success(f"✅ 成功同步 {len(df_f)} 場最新賽事與即時水位！")
-                        st.cache_data.clear()
                         st.rerun()
                     else:
                         st.warning("API 回傳為空，可能近期無賽事或額度耗盡。")
                 except Exception as e:
                     st.error(f"API 同步失敗: {e}")
 
-
 # ==========================================
-# 分頁 4: 📸 賽事圖片智能識別與重構
+# 分頁 4: 📸 賽事圖片智能識別與重構 (Gemini 真正 OCR)
 # ==========================================
 with tab4:
     st.markdown("### 📸 歷史賽事圖片數據抓取與介面重構")
     
     if not HAS_GENAI:
-        st.error("⚠️ 系統偵測到缺少 AI 圖像處理套件。請在 GitHub 的 `requirements.txt` 中加入 `google-generativeai` 與 `Pillow`。")
+        st.error("⚠️ 缺少 AI 套件，請在 GitHub `requirements.txt` 中加入 `google-generativeai` 與 `Pillow`。")
+    elif not GEMINI_API_KEY:
+        st.warning("⚠️ 未設定 `GEMINI_API_KEY`，請在 Streamlit Secrets 中填寫。")
     else:
-        st.info("支援上傳賽果截圖、盤口變化圖及技術分析圖。系統將自動提取數據、呈現網頁實況，並寫入數據庫中。")
-        uploaded_files = st.file_uploader("請上傳或貼上賽事網頁截圖 (支援多選)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
+        st.info("上傳賽果截圖，系統將透過 Gemini AI 自動提取真實數據並記錄於雲端資料庫。")
+        uploaded_files = st.file_uploader("上傳賽事截圖", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
-        if uploaded_files:
-            if st.button("🚀 開始智能識別與重構 UI", type="primary"):
-                with st.spinner("🧠 正在使用 AI 解析圖片數據與盤口..."):
+        if uploaded_files and st.button("🚀 開始 Gemini 智能識別與重構 UI", type="primary"):
+            with st.spinner("🧠 Gemini Vision 正在解析截圖中的數據..."):
+                try:
+                    img = Image.open(uploaded_files[0])
+                    model = genai.GenerativeModel('gemini-1.5-flash')
                     
-                    parsed_data = {
-                        "league": "德國甲組聯賽", "datetime": "19/09 02:30",
-                        "home_team": "拜仁慕尼黑", "away_team": "柏林聯",
-                        "home_score": 7, "away_score": 0, "ht_score": "3-0",
-                        "home_yellow": 1, "away_yellow": 3,
-                        "home_red": 0, "away_red": 0,
-                        "home_corner": 9, "away_corner": 2,
-                        "stats": {
-                            "attacks": [166, 42], "dangerous_attacks": [109, 16],
-                            "possession": [68, 32], "shots_on_target": [15, 2],
-                            "shots_off_target": [3, 1], "penalties": [1, 0],
-                            "blocked_shots": [5, 0]
-                        }
+                    prompt = """
+                    請精確提取這張足球比賽截圖中的資訊，並嚴格只回傳純 JSON 格式（不要Markdown括號或其餘文字）：
+                    {
+                      "league": "聯賽名稱",
+                      "datetime": "比賽時間",
+                      "home_team": "主隊名稱",
+                      "away_team": "客隊名稱",
+                      "home_score": 主隊得分數字,
+                      "away_score": 客隊得分數字,
+                      "ht_score": "半場比分如 2-0",
+                      "home_yellow": 主隊黃牌數,
+                      "away_yellow": 客隊黃牌數,
+                      "home_red": 主隊紅牌數,
+                      "away_red": 客隊紅牌數,
+                      "home_corner": 主隊角球數,
+                      "away_corner": 客隊角球數,
+                      "stats": {
+                        "attacks": [主隊進攻, 客隊進攻],
+                        "dangerous_attacks": [主隊危險進攻, 客隊危險進攻],
+                        "possession": [主隊控球率, 客隊控球率],
+                        "shots_on_target": [主隊射正, 客隊射正],
+                        "shots_off_target": [主隊射斜, 客隊射斜],
+                        "penalties": [主隊點球, 客隊點球],
+                        "blocked_shots": [主隊被擋, 客隊被擋]
+                      }
                     }
+                    """
+                    response = model.generate_content([prompt, img])
+                    raw_text = response.text.strip().replace("```json", "").replace("```", "")
+                    parsed_data = json.loads(raw_text)
                     
+                    # 寫入雲端/本地資料庫
                     with engine.begin() as conn:
-                        conn.execute(text("""
-                            CREATE TABLE IF NOT EXISTS historical_match_stats (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT, home_team TEXT, away_team TEXT, 
-                                home_score INT, away_score INT, data_json TEXT, created_at TEXT
-                            )
-                        """))
                         conn.execute(text("""
                             INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
                             VALUES (:h, :a, :hs, :aws, :dj, :ca)
                         """), {
-                            "h": parsed_data['home_team'], "a": parsed_data['away_team'], 
-                            "hs": parsed_data['home_score'], "aws": parsed_data['away_score'],
-                            "dj": json.dumps(parsed_data), "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            "h": parsed_data.get('home_team', ''),
+                            "a": parsed_data.get('away_team', ''),
+                            "hs": parsed_data.get('home_score', 0),
+                            "aws": parsed_data.get('away_score', 0),
+                            "dj": json.dumps(parsed_data),
+                            "ca": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         })
-                    st.success("✅ 數據擷取成功，已寫入 historical_match_stats 資料庫。以下為自動重構的實況介面：")
-                    
-                    st.markdown(f"""
-                    <div class="match-header-dark">
-                        <div class="match-title">{parsed_data['league']} • {parsed_data['datetime']}</div>
-                        <div>
-                            <div class="team-name">{parsed_data['home_team']}</div>
-                            <div class="score-large">{parsed_data['home_score']}</div>
-                            <div class="match-status">
-                                <div class="status-text">完'</div>
-                                <div class="cards-corners">
-                                    <span class="yellow-card">🟨 {parsed_data['home_yellow']}</span>
-                                    <span class="red-card">🟥 {parsed_data['home_red']}</span>
-                                    <span class="corner-flag">🚩 {parsed_data['home_corner']} - {parsed_data['away_corner']}</span>
-                                    <span class="yellow-card">🟨 {parsed_data['away_yellow']}</span>
-                                </div>
-                                <div class="ht-score">HT: ({parsed_data['ht_score']})</div>
-                            </div>
-                            <div class="score-large">{parsed_data['away_score']}</div>
-                            <div class="team-name">{parsed_data['away_team']}</div>
+                    st.success("✅ AI 成功識別數據並儲存至雲端資料庫！")
+                    st.session_state['current_parsed_match'] = parsed_data
+                except Exception as e:
+                    st.error(f"圖片識別解析失敗: {e}")
+
+        # 顯示解析好的最新賽事或歷史記錄
+        parsed_data = st.session_state.get('current_parsed_match', None)
+        
+        # 若當前 session 無數據，自動從資料庫讀取最新的截圖紀錄
+        if not parsed_data:
+            try:
+                db_record = pd.read_sql("SELECT data_json FROM historical_match_stats ORDER BY id DESC LIMIT 1", engine)
+                if not db_record.empty:
+                    parsed_data = json.loads(db_record.iloc[0]['data_json'])
+            except: pass
+
+        if parsed_data:
+            st.markdown(f"""
+            <div class="match-header-dark">
+                <div class="match-title">{parsed_data.get('league','')} • {parsed_data.get('datetime','')}</div>
+                <div>
+                    <div class="team-name">{parsed_data.get('home_team','')}</div>
+                    <div class="score-large">{parsed_data.get('home_score',0)}</div>
+                    <div class="match-status">
+                        <div class="status-text">完'</div>
+                        <div class="cards-corners">
+                            <span class="yellow-card">🟨 {parsed_data.get('home_yellow',0)}</span>
+                            <span class="red-card">🟥 {parsed_data.get('home_red',0)}</span>
+                            <span class="corner-flag">🚩 {parsed_data.get('home_corner',0)} - {parsed_data.get('away_corner',0)}</span>
+                            <span class="yellow-card">🟨 {parsed_data.get('away_yellow',0)}</span>
                         </div>
+                        <div class="ht-score">HT: ({parsed_data.get('ht_score','-')})</div>
                     </div>
-                    """, unsafe_allow_html=True)
-                    
-                    sub_tab1, sub_tab2, sub_tab3 = st.tabs(["📊 技術統計", "📉 盤口變化", "⚔️ 對賽往績"])
-                    
-                    with sub_tab1:
-                        s = parsed_data['stats']
-                        st.markdown("""
-                        <div class="stats-container">
-                            <div class="stats-title">足球比分、足球賽果、技術統計、即場概況及即場比分數據</div>
-                            
-                            <div style="display:flex; justify-content:space-around; text-align:center; margin-bottom: 25px;">
-                                <div>
-                                    <div style="color:#94a3b8; font-size:14px; margin-bottom:5px;">進攻</div>
-                                    <div style="font-size: 20px;"><span style="color:#3b82f6">{0}</span> <span style="font-size:24px; color:#475569;"> > </span> <span style="color:#ffcc00">{1}</span></div>
-                                </div>
-                                <div>
-                                    <div style="color:#94a3b8; font-size:14px; margin-bottom:5px;">危險進攻</div>
-                                    <div style="font-size: 20px;"><span style="color:#3b82f6">{2}</span> <span style="font-size:24px; color:#475569;"> ≫ </span> <span style="color:#ffcc00">{3}</span></div>
-                                </div>
-                                <div>
-                                    <div style="color:#94a3b8; font-size:14px; margin-bottom:5px;">控球率</div>
-                                    <div style="font-size: 20px;"><span style="color:#3b82f6">{4}</span> <span style="font-size:24px; color:#475569;"> % </span> <span style="color:#ffcc00">{5}</span></div>
-                                </div>
-                            </div>
-                        """.format(s['attacks'][0], s['attacks'][1], s['dangerous_attacks'][0], s['dangerous_attacks'][1], s['possession'][0], s['possession'][1]), unsafe_allow_html=True)
-                        
-                        def build_bar(label, val_h, val_a):
-                            total = val_h + val_a if (val_h + val_a) > 0 else 1
-                            pct_h = (val_h / total) * 100
-                            pct_a = (val_a / total) * 100
-                            return f"""
-                            <div style="margin-bottom: 12px;">
-                                <div style="display:flex; justify-content:space-between; font-size:14px; margin-bottom:3px;">
-                                    <span style="color:#3b82f6;">{val_h}</span>
-                                    <span style="color:#cbd5e1;">{label}</span>
-                                    <span style="color:#ffcc00;">{val_a}</span>
-                                </div>
-                                <div style="display:flex; height:6px; background:#2d3748; border-radius:3px;">
-                                    <div style="width:{pct_h}%; background:#3b82f6; border-radius:3px 0 0 3px;"></div>
-                                    <div style="width:{pct_a}%; background:#ffcc00; border-radius:0 3px 3px 0;"></div>
-                                </div>
-                            </div>
-                            """
-                        
-                        html_bars = build_bar("射正", s['shots_on_target'][0], s['shots_on_target'][1])
-                        html_bars += build_bar("射斜", s['shots_off_target'][0], s['shots_off_target'][1])
-                        html_bars += build_bar("點球", s['penalties'][0], s['penalties'][1])
-                        html_bars += build_bar("被擋掉射門", s['blocked_shots'][0], s['blocked_shots'][1])
-                        
-                        st.markdown(html_bars + "</div>", unsafe_allow_html=True)
-                    
-                    with sub_tab2:
-                        st.markdown('<div class="stats-container"><div class="stats-title">馬會足球賠率變化 (主客和 / 讓球)</div>', unsafe_allow_html=True)
-                        df_odds_mock = pd.DataFrame({
-                            "時間": ["17-09 04:10", "18-09 17:00", "18-09 18:10"],
-                            "主 (勝)": ["1.03", "1.00 <span style='color:red'>↓</span>", "1.00 <span style='color:red'>↓</span>"],
-                            "和": ["9.5", "13.5 <span style='color:#10b981'>↑</span>", "12.5 <span style='color:#10b981'>↑</span>"],
-                            "客 (負)": ["22.0", "24.0 <span style='color:#10b981'>↑</span>", "27.0 <span style='color:#10b981'>↑</span>"],
-                            "讓球盤口": ["[-3/-3.5]", "[-3.5/-4]", "[-3.5/-4]"],
-                            "主 (讓)": ["1.78", "1.80 <span style='color:red'>↓</span>", "1.83 <span style='color:red'>↓</span>"],
-                            "客 (讓)": ["1.99", "2.03 <span style='color:#10b981'>↑</span>", "1.99 <span style='color:#10b981'>↑</span>"]
-                        })
-                        st.markdown(df_odds_mock.to_html(escape=False, index=False, classes="table table-dark table-striped"), unsafe_allow_html=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    with sub_tab3:
-                        st.markdown('<div class="stats-container"><div class="stats-title">對賽往績、近況戰績和聯賽積分榜數據</div>', unsafe_allow_html=True)
-                        st.markdown("""
-                        <div style="font-size:13px; color:#94a3b8; margin-bottom:15px;">過去 10 次對賽，拜仁慕尼黑贏 7 場、和 3 場、負 0 場。</div>
-                        """, unsafe_allow_html=True)
-                        
-                        df_h2h_mock = pd.DataFrame({
-                            "日期/賽事": ["2026-03-21 德甲", "2025-12-04 德國盃"],
-                            "主客": ["拜仁慕尼黑 vs 柏林聯", "柏林聯 vs 拜仁慕尼黑"],
-                            "半全": ["主主", "客客"],
-                            "比分": ["4-0 (2-0)", "2-3 (1-3)"],
-                            "讓球": ["-2.25 贏", "+1.5 輸"],
-                            "球數": ["大", "大"],
-                            "角球": ["12-1", "2-4"]
-                        })
-                        st.markdown(df_h2h_mock.to_html(escape=False, index=False, classes="table table-dark"), unsafe_allow_html=True)
-                        st.markdown('</div>', unsafe_allow_html=True)
+                    <div class="score-large">{parsed_data.get('away_score',0)}</div>
+                    <div class="team-name">{parsed_data.get('away_team','')}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            sub_tab1, sub_tab2 = st.tabs(["📊 技術統計", "📜 歷史記錄庫"])
+            
+            with sub_tab1:
+                s = parsed_data.get('stats', {})
+                att = s.get('attacks', [0, 0])
+                d_att = s.get('dangerous_attacks', [0, 0])
+                pos = s.get('possession', [50, 50])
+                
+                st.markdown(f"""
+                <div class="stats-container">
+                    <div class="stats-title">比賽技術數據分析</div>
+                    <div style="display:flex; justify-content:space-around; text-align:center; margin-bottom: 20px;">
+                        <div><div style="color:#94a3b8; font-size:12px;">進攻</div><div style="font-size:18px;">{att[0]} vs {att[1]}</div></div>
+                        <div><div style="color:#94a3b8; font-size:12px;">危險進攻</div><div style="font-size:18px;">{d_att[0]} vs {d_att[1]}</div></div>
+                        <div><div style="color:#94a3b8; font-size:12px;">控球率</div><div style="font-size:18px;">{pos[0]}% vs {pos[1]}%</div></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with sub_tab2:
+                try:
+                    df_h = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, created_at FROM historical_match_stats ORDER BY id DESC", engine)
+                    st.dataframe(df_h, use_container_width=True)
+                except: pass
