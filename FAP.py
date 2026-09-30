@@ -28,7 +28,7 @@ THE_ODDS_API_KEY = get_secret("THE_ODDS_API_KEY")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 DATABASE_URL = get_secret("DATABASE_URL")
 
-# --- 2. 雲端/本地 資料庫連線配置 (含安全降級容錯機制) ---
+# --- 2. 雲端/本地 資料庫連線配置 ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 db_path = os.path.join(CURRENT_DIR, "football_data.db")
 sqlite_engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
@@ -142,7 +142,53 @@ def get_candidate_gemini_models():
     except Exception:
         return preferred_models
 
-# --- 4. 輔助與正規化函數 ---
+# --- 4. 數據合併與正規化邏輯 (新增/覆蓋合併機制) ---
+def is_valid_val(v):
+    """判斷數據是否為有效值（非空、非零預設值）"""
+    if v is None:
+        return False
+    if isinstance(v, (int, float)) and v == 0:
+        return False
+    if isinstance(v, str) and v.strip() in ["", "0", "-", "N/A", "未知", "未知聯賽", "未知主隊", "未知客隊"]:
+        return False
+    if isinstance(v, list) and (len(v) == 0 or all(not is_valid_val(x) for x in v)):
+        return False
+    if isinstance(v, dict) and len(v) == 0:
+        return False
+    return True
+
+def merge_match_json(old_data, new_data):
+    """將 Gemini 新解析的 JSON 與數據庫舊 JSON 進行智慧合併（補缺與覆蓋舊值）"""
+    if not old_data:
+        return new_data
+    if not new_data:
+        return old_data
+
+    merged = dict(old_data)
+
+    for k, new_v in new_data.items():
+        old_v = merged.get(k)
+
+        # 若是字典（如 stats, odds_trend, recent_form），進行深層合併
+        if isinstance(new_v, dict) and isinstance(old_v, dict):
+            merged_dict = dict(old_v)
+            for sub_k, sub_v in new_v.items():
+                if is_valid_val(sub_v):
+                    merged_dict[sub_k] = sub_v
+            merged[k] = merged_dict
+
+        # 若是陣列 (如 recent_form 列表)
+        elif isinstance(new_v, list):
+            if is_valid_val(new_v):
+                merged[k] = new_v
+
+        # 一般欄位：若新資料有效，則進行更新或覆蓋
+        else:
+            if is_valid_val(new_v):
+                merged[k] = new_v
+
+    return merged
+
 def normalize_to_yyyy_mm_dd(dt_str, fallback_dt=None):
     """將格式不同的日期統一為 YYYY-MM-DD"""
     if not dt_str or not isinstance(dt_str, str):
@@ -435,7 +481,7 @@ with tab3:
                     st.error(f"API 同步失敗: {e}")
 
 # ==========================================
-# 分頁 4: 📸 賽事圖片智能識別與歷史數據庫 (具備自動模型備援與高限額處理)
+# 分頁 4: 📸 賽事圖片智能識別與歷史數據庫 (支援：新增賽事 / 選擇已有賽事覆蓋與增補)
 # ==========================================
 with tab4:
     st.markdown("### 📸 歷史賽事圖片數據抓取與數據庫")
@@ -445,115 +491,188 @@ with tab4:
     elif not GEMINI_API_KEY:
         st.warning("⚠ 未設定 `GEMINI_API_KEY`，請至 Streamlit Secrets 填寫。")
     else:
-        st.info("💡 請一次上傳該場賽事的所有截圖（包含：賽果比分、技術統計、盤口與水位變化表、主/客隊近況戰績）。Gemini 將跨圖智能整合所有數據。")
+        # --- 操作模式選擇 (新增賽事 vs 補充已有賽事) ---
+        op_mode = st.radio(
+            "📌 請選擇操作模式：",
+            ["➕ 新增全新賽事紀錄", "🔄 更新 / 補充已有賽事紀錄"],
+            horizontal=True
+        )
+
+        selected_existing_id = None
+        existing_record_json = None
+
+        # 讀取目前數據庫中的所有紀錄以供選取
+        try:
+            df_existing = pd.read_sql("SELECT id, home_team, away_team, home_score, away_score, data_json, created_at FROM historical_match_stats ORDER BY id DESC", engine)
+        except Exception:
+            df_existing = pd.DataFrame()
+
+        if op_mode == "🔄 更新 / 補充已有賽事紀錄":
+            if df_existing.empty:
+                st.warning("⚠️ 目前數據庫中尚未有任何賽事紀錄，請先選擇「新增全新賽事紀錄」。")
+            else:
+                match_options = {}
+                for _, r in df_existing.iterrows():
+                    try:
+                        dj = json.loads(r['data_json']) if r.get('data_json') and pd.notna(r['data_json']) else {}
+                    except Exception:
+                        dj = {}
+                    m_time = dj.get('datetime', r.get('created_at', ''))
+                    m_league = dj.get('league', '賽事')
+                    label = f"[{m_league} | {m_time}] {r['home_team']} {r['home_score']} - {r['away_score']} {r['away_team']} (ID: {r['id']})"
+                    match_options[r['id']] = (label, dj)
+
+                selected_existing_id = st.selectbox(
+                    "⚽ 請選擇要補充/更新數據的已有賽事：",
+                    options=list(match_options.keys()),
+                    format_func=lambda x: match_options[x][0]
+                )
+                if selected_existing_id:
+                    existing_record_json = match_options[selected_existing_id][1]
+                    st.info(f"💡 將為賽事 **[{match_options[selected_existing_id][0]}]** 補充新圖片數據。若有重複欄位將以新圖為準覆蓋，缺失欄位將自動補齊。")
+
+        st.info("💡 請上傳該場賽事的截圖（包含：賽果比分、技術統計、盤口水位變化、近況戰績）。Gemini 將進行跨圖解析。")
         uploaded_files = st.file_uploader("上傳賽事截圖 (可選擇多張圖片)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
         
-        if uploaded_files and st.button("🚀 開始 Gemini 多圖綜合識別與解析", type="primary"):
-            candidate_models = get_candidate_gemini_models()
-            images = [Image.open(file).convert('RGB') for file in uploaded_files]
-            
-            prompt = """
-            你是一個專業足球數據與體育博彩數據分析 AI。你將會收到一張或多張關於同一場賽事（或相關賽事）的截圖，內容可能包含：
-            1. 賽果比分與基本資訊（聯賽名稱、時間、主隊、客隊、半全場比分、黃/紅牌、角球）。
-            2. 詳細技術統計（進攻、危險進攻、控球率、射正、射斜、點球、被擋射門等）。
-            3. 莊家盤口與水位變化表（讓球盤口與初盤/即時水位、大細球盤口與初盤/即時水位、水位走勢紀錄）。
-            4. 主隊與客隊近況戰績 / 歷史交鋒對賽紀錄。
-
-            請綜合所有提供的截圖，精確結構化提取資料，並嚴格只回傳 JSON 格式（絕對不要包含 Markdown 程式碼標記、註解或額外文字）：
-            {
-              "league": "聯賽名稱（例如：歐洲國家聯賽、英超、西甲等）",
-              "datetime": "比賽日期時間（格式為 YYYY-MM-DD HH:MM，例如：2026-09-30 02:45；若未顯示年份請預設為 2026 年）",
-              "home_team": "主隊名稱",
-              "away_team": "客隊名稱",
-              "home_score": 主隊最終得分數字,
-              "away_score": 客隊最終得分數字,
-              "ht_score": "半場比分（例如：2-1，若無則填 '-'）",
-              "home_yellow": 主隊黃牌數數字,
-              "away_yellow": 客隊黃牌數數字,
-              "home_red": 主隊紅牌數數字,
-              "away_red": 客隊紅牌數數字,
-              "home_corner": 主隊角球數數字,
-              "away_corner": 客隊角球數數字,
-              "stats": {
-                "attacks": [主隊進攻數, 客隊進攻數],
-                "dangerous_attacks": [主隊危險進攻數, 客隊危險進攻數],
-                "possession": [主隊控球率數字, 客隊控球率數字],
-                "shots_on_target": [主隊射正數, 客隊射正數],
-                "shots_off_target": [主隊射偏數, 客隊射偏數]
-              },
-              "odds_trend": {
-                "ah_line": "讓球盤口（例如：[-1.5/-2], [-2], 0，若未顯示填 '0'）",
-                "home_initial_odd": 主隊讓球初盤水位數字（例如 1.83，若無填 0）,
-                "home_current_odd": 主隊讓球即時/終盤水位數字（例如 1.98，若無填 0）,
-                "away_initial_odd": 客隊讓球初盤水位數字（例如 1.93，若無填 0）,
-                "away_current_odd": 客隊讓球即時/終盤水位數字（例如 1.82，若無填 0）,
-                "ou_line": "大細球盤口（例如：2.5, 2.75, 3，若未顯示填 '2.5'）",
-                "ou_over_initial": 大球初盤水位數字（例如 1.85，若無填 0）,
-                "ou_over_current": 大球即時水位數字（例如 1.95，若無填 0）,
-                "ou_under_initial": 細球初盤水位數字（例如 1.95，若無填 0）,
-                "ou_under_current": 細球即時水位數字（例如 1.85，若無填 0）
-              },
-              "recent_form": {
-                "home_recent": ["主隊近況戰績摘要列表，如：26-09-27 歐國聯 vs 英格蘭 2-3"],
-                "away_recent": ["客隊近況戰績摘要列表，如：26-09-27 歐國聯 vs 捷克 1-2"]
-              }
-            }
-
-            【注意事項】
-            1. 請整合所有上傳圖片中的訊息。若有盤口變化截圖，初盤請採最早時間之水位，終盤/即時盤請採最晚時間之水位。
-            2. 若圖片中找不到特定數字欄位，請用數字 0 替代，字串用 'N/A'，嚴禁輸出 null 或未定義值。
-            3. 數字請確保為純整數或浮點數（例如: 1.83 而非 "1.83"）。
-            4. datetime 請務必確保格式包含完整年份（如 2026-09-30 02:45）。
-            """
-            
-            parsed_data = None
-            last_error = None
-            
-            # 模型輪詢與降級備援機制 (Auto Fallback)
-            for model_name in candidate_models:
-                try:
-                    with st.spinner(f"🧠 嘗試使用 Gemini 模型 ({model_name}) 進行跨圖解析..."):
-                        model = genai.GenerativeModel(model_name)
-                        response = model.generate_content([prompt] + images)
-                        raw_text = response.text.strip().replace('```json', '').replace('```', '').strip()
-                        
-                        start_idx = raw_text.find('{')
-                        end_idx = raw_text.rfind('}')
-                        if start_idx != -1 and end_idx != -1:
-                            raw_text = raw_text[start_idx:end_idx+1]
-                            
-                        parsed_data = json.loads(raw_text)
-                        if parsed_data:
-                            st.toast(f"✅ 成功調用模型：{model_name}")
-                            break
-                except Exception as e:
-                    last_error = e
-                    # 若遇額度不足 (429) 或模型錯誤，自動切換至備援模型
-                    continue
-            
-            if parsed_data:
-                parsed_dt = parsed_data.get('datetime', '')
-                parsed_data['datetime'] = parsed_dt if parsed_dt else datetime.now().strftime("%Y-%m-%d %H:%M")
-                
-                try:
-                    with engine.begin() as conn:
-                        conn.execute(text("""
-                            INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
-                            VALUES (:h, :a, :hs, :aws, :dj, :ca)
-                        """), {
-                            'h': parsed_data.get('home_team', '未知主隊'),
-                            'a': parsed_data.get('away_team', '未知客隊'),
-                            'hs': int(parsed_data.get('home_score') or 0),
-                            'aws': int(parsed_data.get('away_score') or 0),
-                            'dj': json.dumps(parsed_data, ensure_ascii=False),
-                            'ca': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                    st.success(f"✅ AI 成功識別並整合了 {len(uploaded_files)} 張截圖數據，已成功寫入數據庫！")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"資料庫寫入失敗: {e}")
+        btn_label = "🚀 開始 Gemini 多圖綜合識別與解析" if op_mode == "➕ 新增全新賽事紀錄" else "🔄 開始 Gemini 識別並更新至選定賽事"
+        
+        if uploaded_files and st.button(btn_label, type="primary"):
+            if op_mode == "🔄 更新 / 補充已有賽事紀錄" and not selected_existing_id:
+                st.error("請先選取要更新的賽事紀錄！")
             else:
-                st.error(f"所有 Gemini 模型嘗試皆失敗。最後錯誤訊息: {last_error}")
+                candidate_models = get_candidate_gemini_models()
+                images = [Image.open(file).convert('RGB') for file in uploaded_files]
+                
+                prompt = """
+                你是一個專業足球數據與體育博彩數據分析 AI。你將會收到一張或多張關於同一場賽事（或相關賽事）的截圖，內容可能包含：
+                1. 賽果比分與基本資訊（聯賽名稱、時間、主隊、客隊、半全場比分、黃/紅牌、角球）。
+                2. 詳細技術統計（進攻、危險進攻、控球率、射正、射斜、點球、被擋射門等）。
+                3. 莊家盤口與水位變化表（讓球盤口與初盤/即時水位、大細球盤口與初盤/即時水位、水位走勢紀錄）。
+                4. 主隊與客隊近況戰績 / 歷史交鋒對賽紀錄。
+
+                請綜合所有提供的截圖，精確結構化提取資料，並嚴格只回傳 JSON 格式（絕對不要包含 Markdown 程式碼標記、註解或額外文字）：
+                {
+                  "league": "聯賽名稱（例如：歐洲國家聯賽、英超、西甲等）",
+                  "datetime": "比賽日期時間（格式為 YYYY-MM-DD HH:MM，例如：2026-09-30 02:45；若未顯示年份請預設為 2026 年）",
+                  "home_team": "主隊名稱",
+                  "away_team": "客隊名稱",
+                  "home_score": 主隊最終得分數字,
+                  "away_score": 客隊最終得分數字,
+                  "ht_score": "半場比分（例如：2-1，若無則填 '-'）",
+                  "home_yellow": 主隊黃牌數數字,
+                  "away_yellow": 客隊黃牌數數字,
+                  "home_red": 主隊紅牌數數字,
+                  "away_red": 客隊紅牌數數字,
+                  "home_corner": 主隊角球數數字,
+                  "away_corner": 客隊角球數數字,
+                  "stats": {
+                    "attacks": [主隊進攻數, 客隊進攻數],
+                    "dangerous_attacks": [主隊危險進攻數, 客隊危險進攻數],
+                    "possession": [主隊控球率數字, 客隊控球率數字],
+                    "shots_on_target": [主隊射正數, 客隊射正數],
+                    "shots_off_target": [主隊射偏數, 客隊射偏數]
+                  },
+                  "odds_trend": {
+                    "ah_line": "讓球盤口（例如：[-1.5/-2], [-2], 0，若未顯示填 '0'）",
+                    "home_initial_odd": 主隊讓球初盤水位數字（例如 1.83，若無填 0）,
+                    "home_current_odd": 主隊讓球即時/終盤水位數字（例如 1.98，若無填 0）,
+                    "away_initial_odd": 客隊讓球初盤水位數字（例如 1.93，若無填 0）,
+                    "away_current_odd": 客隊讓球即時/終盤水位數字（例如 1.82，若無填 0）,
+                    "ou_line": "大細球盤口（例如：2.5, 2.75, 3，若未顯示填 '2.5'）",
+                    "ou_over_initial": 大球初盤水位數字（例如 1.85，若無填 0）,
+                    "ou_over_current": 大球即時水位數字（例如 1.95，若無填 0）,
+                    "ou_under_initial": 細球初盤水位數字（例如 1.95，若無填 0）,
+                    "ou_under_current": 細球即時水位數字（例如 1.85，若無填 0）
+                  },
+                  "recent_form": {
+                    "home_recent": ["主隊近況戰績摘要列表，如：26-09-27 歐國聯 vs 英格蘭 2-3"],
+                    "away_recent": ["客隊近況戰績摘要列表，如：26-09-27 歐國聯 vs 捷克 1-2"]
+                  }
+                }
+
+                【注意事項】
+                1. 請整合所有上傳圖片中的訊息。若有盤口變化截圖，初盤請採最早時間之水位，終盤/即時盤請採最晚時間之水位。
+                2. 若圖片中找不到特定數字欄位，請用數字 0 替代，字串用 'N/A'，嚴禁輸出 null 或未定義值。
+                3. 數字請確保為純整數或浮點數（例如: 1.83 而非 "1.83"）。
+                4. datetime 請務必確保格式包含完整年份（如 2026-09-30 02:45）。
+                """
+                
+                parsed_data = None
+                last_error = None
+                
+                # 模型輪詢與自動降級備援機制
+                for model_name in candidate_models:
+                    try:
+                        with st.spinner(f"🧠 嘗試使用 Gemini 模型 ({model_name}) 進行跨圖解析..."):
+                            model = genai.GenerativeModel(model_name)
+                            response = model.generate_content([prompt] + images)
+                            raw_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+                            
+                            start_idx = raw_text.find('{')
+                            end_idx = raw_text.rfind('}')
+                            if start_idx != -1 and end_idx != -1:
+                                raw_text = raw_text[start_idx:end_idx+1]
+                                
+                            parsed_data = json.loads(raw_text)
+                            if parsed_data:
+                                st.toast(f"✅ 成功調用模型：{model_name}")
+                                break
+                    except Exception as e:
+                        last_error = e
+                        continue
+                
+                if parsed_data:
+                    parsed_dt = parsed_data.get('datetime', '')
+                    parsed_data['datetime'] = parsed_dt if parsed_dt else datetime.now().strftime("%Y-%m-%d %H:%M")
+                    
+                    if op_mode == "🔄 更新 / 補充已有賽事紀錄" and selected_existing_id:
+                        # 執行數據合併：將 new_data 覆蓋/增補到 existing_record_json
+                        merged_data = merge_match_json(existing_record_json, parsed_data)
+                        
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    UPDATE historical_match_stats
+                                    SET home_team = :h,
+                                        away_team = :a,
+                                        home_score = :hs,
+                                        away_score = :aws,
+                                        data_json = :dj
+                                    WHERE id = :id
+                                """), {
+                                    'h': merged_data.get('home_team', '未知主隊'),
+                                    'a': merged_data.get('away_team', '未知客隊'),
+                                    'hs': int(merged_data.get('home_score') or 0),
+                                    'aws': int(merged_data.get('away_score') or 0),
+                                    'dj': json.dumps(merged_data, ensure_ascii=False),
+                                    'id': selected_existing_id
+                                })
+                            st.success(f"✅ 已成功將 {len(uploaded_files)} 張新圖片的數據合併至該賽事紀錄（補齊缺項並更新舊數據）！")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"資料庫更新失敗: {e}")
+
+                    else:
+                        # 全新賽事紀錄新增
+                        try:
+                            with engine.begin() as conn:
+                                conn.execute(text("""
+                                    INSERT INTO historical_match_stats (home_team, away_team, home_score, away_score, data_json, created_at)
+                                    VALUES (:h, :a, :hs, :aws, :dj, :ca)
+                                """), {
+                                    'h': parsed_data.get('home_team', '未知主隊'),
+                                    'a': parsed_data.get('away_team', '未知客隊'),
+                                    'hs': int(parsed_data.get('home_score') or 0),
+                                    'aws': int(parsed_data.get('away_score') or 0),
+                                    'dj': json.dumps(parsed_data, ensure_ascii=False),
+                                    'ca': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                })
+                            st.success(f"✅ AI 成功識別並整合了 {len(uploaded_files)} 張截圖數據，已新增至數據庫！")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"資料庫寫入失敗: {e}")
+                else:
+                    st.error(f"所有 Gemini 模型嘗試皆失敗。最後錯誤訊息: {last_error}")
 
     st.divider()
     st.markdown("### 📅 歷史賽事紀錄查詢")
